@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(unzip -o \"/c/Users/antob/Downloads/madrelingua-ai---coach-inglese \\(13\\).zip\" -d .)",
+      "Read(//tmp/**)",
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "Bash(npm test *)",
+      "Bash(node \"C:\\\\Users\\\\antob\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-antob-OneDrive-Desktop-Madrelingua-AI\\\\4cc11260-edf7-432c-9729-fdded9c0ed23\\\\scratchpad\\\\test-live-ws.mjs\")",
+      "Bash(cp \"C:\\\\Users\\\\antob\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-antob-OneDrive-Desktop-Madrelingua-AI\\\\4cc11260-edf7-432c-9729-fdded9c0ed23\\\\scratchpad\\\\test-live-ws.mjs\" \"/c/Users/antob/OneDrive/Desktop/Madrelingua AI/scripts/_diag-live-ws.mjs\")",
+      "Bash(node scripts/_diag-live-ws.mjs)",
+      "Bash(printenv)",
+      "Bash(powershell.exe -Command \"[Environment]::GetEnvironmentVariable\\('GEMINI_API_KEY','User'\\)\")",
+      "Bash(powershell.exe -Command \"[Environment]::GetEnvironmentVariable\\('GEMINI_API_KEY','Machine'\\)\")",
+      "Bash(npx vite *)",
+      "Bash(npx vitest *)",
+      "PowerShell(Get-Process -Name node -ErrorAction SilentlyContinue)",
+      "PowerShell(Stop-Process -Force -ErrorAction SilentlyContinue)",
+      "PowerShell(\"done\")",
+      "Bash(npx tsx *)",
+      "Bash(curl -s http://localhost:3000/api/health)",
+      "PowerShell(Stop-Process -Id 30504 -Force -ErrorAction SilentlyContinue)",
+      "Bash(git init *)",
+      "Bash(git add *)"
+    ]
+  }
+}

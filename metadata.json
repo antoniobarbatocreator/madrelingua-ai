@@ -1,0 +1,10 @@
+{
+  "name": "Madrelingua AI - Coach Inglese",
+  "description": "Assistente vocale madrelingua inglese basato sulla metodologia di neuroapprendimento Inglese Per Negati, con gestione Knowledge Base PDF personalizzata, tolleranza pause per riflettere e correzioni chiare in italiano.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

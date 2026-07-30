@@ -3,7 +3,6 @@ import {
   X,
   Bookmark,
   CheckCircle2,
-  Sparkles,
   BookOpen,
   Volume2,
   RefreshCw,

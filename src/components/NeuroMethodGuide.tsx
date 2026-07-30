@@ -1,14 +1,11 @@
 import React, { useState } from 'react';
 import {
-  Brain,
   HeartHandshake,
   Hourglass,
   Blocks,
   Languages,
   Check,
   ChevronDown,
-  Sparkles,
-  Zap,
 } from 'lucide-react';
 
 export const NeuroMethodGuide: React.FC = () => {
@@ -176,10 +173,10 @@ export const NeuroMethodGuide: React.FC = () => {
             </ul>
           </div>
 
-          {/* Madrelingua AI */}
+          {/* Madrelingua Coach */}
           <div className="p-4 rounded-xl bg-amber-500/5 border border-amber-500/20 space-y-2 text-xs">
             <div className="font-bold text-amber-400 uppercase tracking-wider text-[10px]">
-              Madrelingua AI
+              Madrelingua Coach
             </div>
             <ul className="space-y-2 text-slate-200">
               <li className="flex items-start gap-2">

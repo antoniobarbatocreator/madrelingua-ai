@@ -76,26 +76,18 @@ export const AppLogo: React.FC<AppLogoProps> = ({
           <line x1="17.5" y1="8" x2="17.5" y2="22" stroke="#f43f5e" strokeWidth="2.5" strokeLinecap="round" />
           <line x1="21" y1="11" x2="21" y2="19" stroke="url(#ukBarGrad)" strokeWidth="2.2" strokeLinecap="round" />
 
-          {/* AI Spark Star top right in Union Jack White/Blue accent */}
-          <path
-            d="M24 7L24.7 8.3L26 9L24.7 9.7L24 11L23.3 9.7L22 9L23.3 8.3L24 7Z"
-            fill="#38bdf8"
-          />
         </svg>
       </div>
 
       {/* Brand Text */}
       {showText && (
         <div className="flex flex-col">
-          <span className={`font-bold tracking-tight text-slate-100 ${currentSize.text} leading-tight flex items-center gap-1.5`}>
-            <span>Madrelingua</span>
-            <span className="bg-gradient-to-r from-emerald-400 via-rose-400 to-sky-400 bg-clip-text text-transparent font-extrabold">
-              AI
-            </span>
+          <span className={`font-bold tracking-tight text-slate-100 ${currentSize.text} leading-tight`}>
+            Madrelingua
           </span>
           {size === 'xl' && (
             <span className="text-xs text-slate-400 font-medium tracking-wide">
-              Voice Studio & Personal English Coach
+              English Coach
             </span>
           )}
         </div>

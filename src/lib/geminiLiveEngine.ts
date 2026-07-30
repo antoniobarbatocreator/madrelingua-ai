@@ -1085,6 +1085,14 @@ export class GeminiLiveEngine {
 
   private retryTeacherTurnForMissingAudio(reason: string): void {
     if (this.teacherTurnAudioReceived || !this.sessionExpectedActive || this.userRequestedEnd) return;
+    // If we received transcript text but no audio yet, audio may be delayed —
+    // extend the deadline rather than immediately retrying, which would restart
+    // the response and cause a stutter.
+    if (this.teacherTurnTextReceived && this.teacherTurnRetryCount === 0) {
+      this.teacherTurnRetryCount += 1;
+      this.armTeacherAudioWatchdog(8000);
+      return;
+    }
     this.clearTeacherStreamStallWatchdog();
     const socket = this.activeConnection?.ws;
     if (!socket || socket.readyState !== WebSocket.OPEN || !this.activeModelSetupComplete) {
@@ -2196,9 +2204,15 @@ export class GeminiLiveEngine {
         this.activeSourceNodes = this.activeSourceNodes.filter((s) => s !== source);
         if (this.activeSourceNodes.length === 0 && this.outputAudioCtx!.currentTime >= this.nextPlayTime - 0.05) {
           this.sentAudioStreamEnd = false;
-          if (this.turnMode !== 'tap_to_talk') this.micOutboundEnabled = true;
-          if (this.voiceSessionState === 'speaking') {
-            this.setVoiceState('listening');
+          // Only re-enable mic and transition to listening if the teacher turn
+          // is actually complete. If teacherPlaybackActive is still true, more
+          // audio chunks may arrive after a network gap — re-enabling the mic
+          // prematurely lets Gemini hear its own audio and self-interrupt.
+          if (!this.teacherPlaybackActive) {
+            if (this.turnMode !== 'tap_to_talk') this.micOutboundEnabled = true;
+            if (this.voiceSessionState === 'speaking') {
+              this.setVoiceState('listening');
+            }
           }
         }
       };

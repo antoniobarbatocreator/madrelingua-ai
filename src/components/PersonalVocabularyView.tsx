@@ -14,7 +14,6 @@ import {
   X,
   Volume2,
   CheckCircle2,
-  Sparkles,
   ArrowUpDown,
   Mic,
   ChevronRight,

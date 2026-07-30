@@ -2,10 +2,9 @@ import React, { useState } from 'react';
 import { ChatMessage, CorrectionItem, KnowledgeDocument, VocabularyChunk, VoiceSettings } from '../types';
 import { playPcmAudio } from '../lib/speech';
 import {
-  Sparkles,
   Volume2,
   RotateCcw,
-  Brain,
+  PenLine,
   Filter,
   BookOpen,
   Check,
@@ -86,7 +85,7 @@ export const VocabularyHistory: React.FC<VocabularyHistoryProps> = ({
     <div className="max-w-6xl mx-auto px-3 sm:px-6 lg:px-8 py-6 text-slate-100 space-y-6">
       {/* Section Header */}
       <SectionHeader
-        icon={<Sparkles className="w-6 h-6 text-amber-400" />}
+        icon={<RotateCcw className="w-6 h-6 text-amber-400" />}
         title="Ripasso"
         description="Ritrova le espressioni salvate, le correzioni ricevute e gli elementi da consolidare."
       />
@@ -113,7 +112,7 @@ export const VocabularyHistory: React.FC<VocabularyHistoryProps> = ({
               : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
           }`}
         >
-          <Brain className="w-3.5 h-3.5" />
+          <PenLine className="w-3.5 h-3.5" />
           <span>Correzioni</span>
           <span className="px-1.5 py-0.2 rounded-full bg-slate-950/40 text-[10px]">
             {correctionsHistory.length}
@@ -146,7 +145,7 @@ export const VocabularyHistory: React.FC<VocabularyHistoryProps> = ({
         <div className="space-y-4">
           {correctionsHistory.length === 0 ? (
             <EmptyState
-              icon={<Brain className="w-6 h-6 text-amber-400" />}
+              icon={<PenLine className="w-6 h-6 text-amber-400" />}
               title="Nessuna correzione ancora"
               description="Le correzioni ricevute durante le sessioni vocali appariranno qui."
             />
@@ -159,7 +158,7 @@ export const VocabularyHistory: React.FC<VocabularyHistoryProps> = ({
                 >
                   <div className="flex items-center justify-between text-[11px] text-slate-400 border-b border-slate-800/60 pb-2">
                     <span className="font-semibold text-amber-400 flex items-center gap-1.5">
-                      <Brain className="w-3.5 h-3.5" />
+                      <PenLine className="w-3.5 h-3.5" />
                       Correzione nel contesto
                     </span>
                     <span>{item.timestamp}</span>

@@ -1,7 +1,7 @@
 {
-  "name": "Madrelingua AI - Coach Inglese",
+  "name": "Madrelingua - English Coach",
   "short_name": "Madrelingua",
-  "description": "Il tuo coach madrelingua inglese con intelligenza artificiale",
+  "description": "Il tuo coach madrelingua per imparare l'inglese",
   "start_url": "/",
   "display": "standalone",
   "orientation": "portrait",

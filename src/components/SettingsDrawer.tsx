@@ -10,7 +10,7 @@ import {
   Save,
   Check,
   Play,
-  Sparkles,
+  GraduationCap,
   Info,
   Loader2,
   AlertCircle,
@@ -218,7 +218,7 @@ export const SettingsDrawer: React.FC<SettingsDrawerProps> = ({
           {/* Section 2: Livello CEFR */}
           <div className="space-y-3">
             <div className="font-bold text-amber-400 uppercase tracking-wider text-[11px] flex items-center gap-1.5">
-              <Sparkles className="w-3.5 h-3.5" />
+              <GraduationCap className="w-3.5 h-3.5" />
               <span>Livello di Inglese (CEFR)</span>
             </div>
 

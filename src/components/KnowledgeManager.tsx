@@ -14,7 +14,6 @@ import {
   Eye,
   X,
   CheckCircle2,
-  Sparkles,
   Info,
   FolderPlus,
 } from 'lucide-react';

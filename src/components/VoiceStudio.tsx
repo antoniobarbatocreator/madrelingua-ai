@@ -16,8 +16,6 @@ import {
 import {
   Mic,
   Volume2,
-  Sparkles,
-  Brain,
   Pause,
   RefreshCw,
   AlertTriangle,
@@ -1010,33 +1008,6 @@ export const VoiceStudio: React.FC<VoiceStudioProps> = ({
   return (
     <div className="flex flex-col h-[calc(100dvh-3.5rem)] md:h-[calc(100vh-4rem)] bg-slate-950 text-slate-100 overflow-hidden w-full max-w-full pb-16 md:pb-0 relative">
       
-      {/* Recovery Prompt Banner for Interrupted Session */}
-      {recoveryPrompt && (
-        <div className="bg-amber-500/15 border-b border-amber-500/40 px-3 sm:px-5 py-2.5 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-3 animate-fadeIn shrink-0 shadow-lg">
-          <div className="flex items-center space-x-2">
-            <RotateCcw className="w-4 h-4 text-amber-400 shrink-0" />
-            <span>
-              La sessione precedente si è interrotta. Vuoi riprenderla senza perdere il contesto?
-            </span>
-          </div>
-          <div className="flex items-center space-x-2 shrink-0">
-            <button
-              onClick={handleResumeSavedSession}
-              className="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg transition-all min-h-[36px] flex items-center gap-1 cursor-pointer"
-            >
-              <Play className="w-3.5 h-3.5 fill-current" />
-              <span>Riprendi</span>
-            </button>
-            <button
-              onClick={handleDismissSavedSession}
-              className="px-3 py-1.5 bg-slate-900 border border-slate-700 hover:bg-slate-800 text-slate-300 font-semibold rounded-lg min-h-[36px] cursor-pointer"
-            >
-              Elimina e riparti
-            </button>
-          </div>
-        </div>
-      )}
-
       {/* Notification Toast */}
       {notificationToast && (
         <div className={`px-3 py-2 text-xs flex items-center justify-between gap-2 border-b animate-fadeIn shrink-0 ${
@@ -1049,7 +1020,7 @@ export const VoiceStudio: React.FC<VoiceStudioProps> = ({
             : 'bg-sky-500/20 border-sky-500/40 text-sky-200'
         }`}>
           <div className="flex items-center space-x-2">
-            {notificationToast.type === 'warning' ? <WifiOff className="w-4 h-4 text-amber-400 shrink-0" /> : <Sparkles className="w-4 h-4 text-sky-400 shrink-0" />}
+            {notificationToast.type === 'warning' ? <WifiOff className="w-4 h-4 text-amber-400 shrink-0" /> : <CheckCircle2 className="w-4 h-4 text-sky-400 shrink-0" />}
             <span className="font-semibold">{notificationToast.msg}</span>
           </div>
           <button

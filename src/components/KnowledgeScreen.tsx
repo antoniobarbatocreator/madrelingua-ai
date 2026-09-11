@@ -12,6 +12,7 @@ import {
   exportAll,
   importAll,
 } from "../lib/knowledge";
+import { parseVocabularyList, isStructuredList } from "../lib/listParser";
 import {
   FileText,
   ClipboardPaste,
@@ -83,6 +84,23 @@ export const KnowledgeScreen: React.FC<KnowledgeScreenProps> = ({ onStartReview 
       fail("Scrivi o incolla almeno qualche riga di appunti.");
       return;
     }
+
+    // A list that is already "word = translation" needs no model at all.
+    // Reading it locally is instant and spends none of the daily allowance.
+    const parsed = parseVocabularyList(text);
+    if (isStructuredList(parsed)) {
+      const res = addSource(title || "Lista personale", "text", text, parsed.items);
+      refresh();
+      setText("");
+      setTitle("");
+      flash(
+        `Lista letta direttamente, senza usare l'analisi: ${res.added} voci aggiunte` +
+          (res.skipped > 0 ? `, ${res.skipped} gia presenti saltate` : "") +
+          (parsed.unparsed > 0 ? `, ${parsed.unparsed} righe ignorate (titoli o note).` : ".")
+      );
+      return;
+    }
+
     setBusy(true);
     setError(null);
     try {
@@ -273,7 +291,7 @@ export const KnowledgeScreen: React.FC<KnowledgeScreenProps> = ({ onStartReview 
                 onChange={(e) => setText(e.target.value)}
                 rows={7}
                 placeholder={
-                  "Incolla qui i tuoi appunti. Vanno bene anche disordinati:\n\nget along with = andare d'accordo\nto put up with -> sopportare\nlook forward to = non vedere l'ora di"
+                  "Una voce per riga, cosi:\n\nget along with = andare d'accordo\nto put up with -> sopportare\nlook forward to = non vedere l'ora di\n\nIn questo formato viene letta all'istante, senza consumare l'analisi. Vanno bene anche appunti in prosa: li legge l'intelligenza artificiale."
                 }
                 className="w-full mt-2 bg-warm border border-warm focus:border-[#C2630B] focus:bg-card rounded-xl px-3 py-2.5 text-sm text-primary placeholder-[#C8BDB2] resize-none outline-none transition-all leading-relaxed"
               />
@@ -325,9 +343,10 @@ export const KnowledgeScreen: React.FC<KnowledgeScreenProps> = ({ onStartReview 
           )}
 
           <p className="text-[11px] text-[#C8BDB2] mt-3 leading-snug border-t border-warm pt-3">
-            L&apos;analisi usa il piano gratuito di Google, che consente circa 20 elaborazioni al
-            giorno. Conviene caricare un documento corposo per volta invece di tanti piccoli: il
-            costo e per elaborazione, non per lunghezza.
+            Una lista gia in formato &quot;parola = traduzione&quot; viene letta sul telefono, gratis
+            e senza limiti, anche con centinaia di voci. Solo gli appunti in prosa e i PDF passano
+            per l&apos;analisi automatica, che sul piano gratuito di Google consente circa 20
+            elaborazioni al giorno.
           </p>
         </section>
 

@@ -21,7 +21,28 @@
       "Bash(curl -s http://localhost:3000/api/health)",
       "PowerShell(Stop-Process -Id 30504 -Force -ErrorAction SilentlyContinue)",
       "Bash(git init *)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git config *)",
+      "PowerShell(npm install -g @railway/cli 2>&1)",
+      "PowerShell(railway version 2>&1)",
+      "PowerShell(railway --help 2>&1)",
+      "PowerShell(railway login 2>&1)",
+      "Bash(git rm *)",
+      "Bash(git commit -m 'Remove bun.lock — use npm for deployment *)",
+      "Bash(railway status *)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" https://madrelingua-ai-production.up.railway.app/api/health)",
+      "Bash(node -e \"require\\('sharp'\\); console.log\\('sharp available'\\)\")",
+      "Bash(node \"C:\\\\Users\\\\antob\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-antob-OneDrive-Desktop-Madrelingua-AI\\\\4cc11260-edf7-432c-9729-fdded9c0ed23\\\\scratchpad\\\\generate-icons.mjs\")",
+      "Bash(node generate-icons.mjs)",
+      "Bash(npx tsc *)",
+      "Bash(railway up *)",
+      "Bash(railway logs *)",
+      "Bash(npx esbuild *)",
+      "Bash(timeout 60 bash -c 'while true; do status=$\\(railway status 2>&1\\); echo \"$status\" | grep -q \"Building\" || { echo \"$status\"; break; }; sleep 10; done')",
+      "Bash(timeout 60 bash -c 'while true; do status=$\\(railway status 2>&1\\); echo \"$status\" | grep -q \"Deploying\" || { echo \"$status\"; break; }; sleep 10; done')",
+      "Bash(timeout 120 bash -c 'while true; do status=$\\(railway status 2>&1\\); echo \"$status\" | grep -qE \"Building|Deploying\" || { echo \"$status\"; break; }; sleep 10; done')",
+      "Bash(node scripts/gen-icons.mjs)"
     ]
   }
 }

@@ -1,1874 +1,681 @@
 import "dotenv/config";
 import express from "express";
 import path from "path";
-import multer from "multer";
 import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
-import * as pdfParseModule from "pdf-parse";
-import { GoogleGenAI, Modality, StartSensitivity, EndSensitivity, ActivityHandling, LiveServerMessage, Type } from "@google/genai";
+import {
+  GoogleGenAI,
+  Modality,
+  StartSensitivity,
+  EndSensitivity,
+  ActivityHandling,
+  LiveServerMessage,
+} from "@google/genai";
 import { createServer as createViteServer } from "vite";
-import { buildLevelInstruction } from "./src/lib/levelProfiles";
-import { buildLearningModeInstruction } from "./src/lib/learningInstructions";
-import { getMacroTopicOverview } from "./src/lib/topicPacks/registry";
-
-const pdfParse: any = (pdfParseModule as any).default || pdfParseModule;
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: "5mb" }));
 
-// Configure multer for memory storage
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB limit
-});
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+if (!GEMINI_API_KEY) {
+  console.error("FATAL: GEMINI_API_KEY non configurata. Il servizio vocale non funzionera.");
+}
 
-// Lazy Gemini client getter
 function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error("GEMINI_API_KEY non configurata nei Secret di AI Studio.");
-  }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        "User-Agent": "aistudio-build",
-      },
-    },
-  });
+  if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY non configurata.");
+  return new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 }
 
-// Helper to retry Gemini calls on transient 429 rate limit or 503 high demand errors
-async function callGeminiWithRetry<T>(
-  fn: () => Promise<T>,
-  maxRetries = 2,
-  initialDelayMs = 1000
-): Promise<T> {
-  let attempt = 0;
-  while (true) {
-    try {
-      return await fn();
-    } catch (err: any) {
-      attempt++;
-      const errStr = String(err?.message || err);
-      const isQuotaExceeded = errStr.includes("Quota exceeded") || errStr.includes("generate_content_free_tier_requests");
-      const isTransient =
-        errStr.includes("429") ||
-        errStr.includes("503") ||
-        errStr.includes("RESOURCE_EXHAUSTED") ||
-        errStr.includes("UNAVAILABLE") ||
-        errStr.includes("quota") ||
-        errStr.includes("high demand") ||
-        errStr.includes("rate-limits");
-
-      if (isTransient && !isQuotaExceeded && attempt <= maxRetries) {
-        const delay = initialDelayMs * Math.pow(2, attempt - 1);
-        console.warn(`[Gemini Retry] Attempt ${attempt}/${maxRetries} failed due to rate limit/high demand. Retrying in ${delay}ms...`);
-        await new Promise((resolve) => setTimeout(resolve, delay));
-      } else {
-        throw err;
-      }
-    }
-  }
-}
-
-// Health check endpoint
 app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok", service: "Madrelingua AI Coach" });
+  res.json({ status: "ok", apiKeySet: !!GEMINI_API_KEY });
 });
 
-// Voice Preview Endpoint for Previewing Gemini prebuilt voices
+// ── Voice preview endpoint ──────────────────────────────────────
 app.post("/api/voice-preview", async (req, res) => {
   try {
     const { voiceName = "Achird", text } = req.body;
     const ai = getGeminiClient();
-
-    const previewText = text && text.trim() ? text.trim() : `Hello there! I'm ${voiceName}, your native English conversation tutor. Let's practice speaking together!`;
-
-    const response = await callGeminiWithRetry(() =>
-      ai.models.generateContent({
-        model: "gemini-3.1-flash-tts-preview",
-        contents: [{ parts: [{ text: previewText }] }],
-        config: {
-          responseModalities: ["AUDIO"],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName },
-            },
-          },
-        },
-      })
-    );
-
+    const previewText = text?.trim() || `Hello! I'm ${voiceName}, your English coach.`;
+    const response = await ai.models.generateContent({
+      model: "gemini-3.1-flash-tts-preview",
+      contents: [{ parts: [{ text: previewText }] }],
+      config: {
+        responseModalities: ["AUDIO"],
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName } } },
+      },
+    });
     const part = response.candidates?.[0]?.content?.parts?.[0];
     if (part?.inlineData?.data) {
-      return res.json({
-        success: true,
-        audioBase64: part.inlineData.data,
-        mimeType: part.inlineData.mimeType || "audio/pcm;rate=24000",
-      });
+      return res.json({ success: true, audioBase64: part.inlineData.data, mimeType: part.inlineData.mimeType || "audio/pcm;rate=24000" });
     }
-
-    return res.status(500).json({ error: "Impossibile generare l'audio di anteprima della voce." });
+    return res.status(500).json({ error: "Nessun audio generato." });
   } catch (error: any) {
-    console.error("Errore generatore anteprima voce:", error);
-    return res.status(500).json({ error: error.message || "Errore nella generazione dell'anteprima vocale." });
+    return res.status(500).json({ error: error.message });
   }
 });
 
-// Helper functions for block splitting and deduplication in PDF processing
-function splitTextIntoBlocks(text: string, blockSize = 10000, overlap = 400): string[] {
-  if (text.length <= blockSize) {
-    return [text];
+// ── Activity definitions ────────────────────────────────────────
+type Activity = "conversazione" | "lezione" | "vocabolario" | "quiz" | "traduci";
+
+function getActivityInstructions(activity: Activity, level: string): string {
+  const l = level || "B1-B2";
+
+  if (activity === "conversazione") {
+    if (l === "A1-A2") return `FREE CONVERSATION — A1-A2:
+- Topics MUST be simple and concrete: family, food and meals, daily routine (what time do you wake up, what do you eat), home and rooms, weather, colors, numbers, animals, clothes, shopping (at the supermarket), basic feelings (happy, sad, tired, hungry).
+- Use only present simple and "to be/to have". No past tense unless the learner brings it up.
+- Ask YES/NO questions or simple WH-questions: "Do you like pizza?", "What is your name?", "Where do you live?", "How many brothers do you have?"
+- If the learner answers in Italian, gently reformulate their answer in simple English and ask them to repeat it.
+- One question at a time. Wait for the answer before moving on.
+- Celebrate every correct sentence enthusiastically in Italian.`;
+
+    if (l === "C1-C2") return `FREE CONVERSATION — C1-C2:
+- Topics should be intellectually stimulating: current affairs, ethical dilemmas, cultural differences between Italy and English-speaking countries, work culture, technology and society, philosophy of language, humor and sarcasm in English, literature and cinema analysis, economic trends, travel experiences in depth.
+- Use natural speech with idioms, phrasal verbs, colloquialisms, and register shifts.
+- Challenge the learner to express nuanced opinions: "What's your take on...?", "How would you argue the opposite?", "Can you put that more diplomatically?"
+- Point out when something sounds "correct but unnatural" — suggest what a native would actually say.
+- Discuss connotations, false friends (actually/attualmente, eventually/eventualmente, sensible/sensibile), and subtle word choices.
+- Push for sophisticated connectors: nevertheless, notwithstanding, as far as I'm concerned, to be fair, having said that.`;
+
+    return `FREE CONVERSATION — B1-B2:
+- Topics: travel experiences, work and career, opinions on news/culture, hobbies in depth, health and lifestyle, future plans, hypothetical situations, comparing Italy with other countries, technology, entertainment.
+- Use present perfect ("Have you ever been to...?"), past simple, future forms, first conditional ("If you go to London, you should visit...").
+- Introduce common phrasal verbs naturally: look forward to, get along with, come across, figure out, turn out, put up with.
+- Ask opinion questions: "What do you think about...?", "Would you rather...?", "What would you do if...?"
+- Model correct forms naturally when the learner makes errors — don't always stop to correct, but weave corrections into your response.
+- Introduce useful collocations: make a decision, take advantage, catch someone's attention, do someone a favour.`;
   }
-  const blocks: string[] = [];
-  let start = 0;
-  while (start < text.length) {
-    let end = start + blockSize;
-    if (end >= text.length) {
-      blocks.push(text.slice(start));
-      break;
-    }
-    let breakPoint = text.lastIndexOf('\n', end);
-    if (breakPoint < start + blockSize - 2000) {
-      breakPoint = text.lastIndexOf('. ', end);
-    }
-    if (breakPoint <= start) {
-      breakPoint = end;
-    } else {
-      breakPoint += 1;
-    }
-    blocks.push(text.slice(start, breakPoint));
-    start = Math.max(start + 1, breakPoint - overlap);
+
+  if (activity === "lezione") {
+    if (l === "A1-A2") return `LESSON MODE — A1-A2:
+- Grammar topics to propose: present simple (affirmative, negative, questions with do/does), to be and to have, articles (a/an/the and when to omit), plurals (regular -s/-es and key irregulars: men, women, children, people), there is/there are, possessive adjectives (my/your/his/her), can/can't, basic prepositions (in/on/at for place and time), this/that/these/those.
+- Expression topics: introducing yourself, asking for directions, ordering food, telling the time, asking prices ("How much is this?"), basic phone calls, at the doctor.
+- Teach ONE rule at a time. Explain in Italian, give 2-3 English examples, then ask the learner to make their own sentence.
+- Use pattern drills: "I like coffee. Now say: I like tea. Now: I like pizza."
+- Highlight Italian-English false friends at this level: "library" non significa "libreria" (bookshop), "actually" non significa "attualmente" (currently).`;
+
+    if (l === "C1-C2") return `LESSON MODE — C1-C2:
+- Grammar topics: mixed conditionals (If I had studied harder, I would be fluent now), inversion for emphasis (Not only did he refuse, but he also...; Rarely have I seen...; Under no circumstances should you...), cleft sentences (What I find most interesting is...; It was only when...), subjunctive in formal English (I suggest he be present; It's essential that she arrive), advanced passive (He is said to have been...; The building is being demolished), discourse markers for essays (Furthermore, In light of, Notwithstanding).
+- Expression topics: negotiation language, diplomatic disagreement, academic writing phrases, formal email register vs casual, presenting arguments, hedging (It could be argued that..., There seems to be...), humor and irony in English.
+- Focus on REGISTER — when to use formal vs informal, written vs spoken English.
+- Discuss etymology and word formation: Latin roots vs Germanic roots in English, and how Italian speakers can leverage their Latin heritage.
+- Analyze real-world texts: headlines, song lyrics, political speeches — discuss style and rhetorical devices.`;
+
+    return `LESSON MODE — B1-B2:
+- Grammar topics to propose: present perfect vs past simple (the Italian struggle), present perfect continuous, future forms (will vs going to vs present continuous for plans), first and second conditional, passive voice, relative clauses (who/which/that/whose and when to omit), reported speech, comparatives and superlatives, modal verbs (should/must/have to/might/could for advice, obligation, possibility).
+- Expression topics: job interviews, making complaints politely, expressing opinions and disagreeing, describing experiences, making plans, discussing pros and cons, giving advice, talking about regrets (I wish I had...).
+- Common error patterns for Italian speakers to address: present perfect ("I live here since 2020" → "I've lived here since 2020"), false friends (eventualmente/eventually, simpatico/sympathetic), word order with adverbs, missing auxiliary in questions.
+- After explaining a rule, give a practical scenario where the learner must use it in conversation.`;
   }
-  return blocks;
+
+  if (activity === "vocabolario") {
+    if (l === "A1-A2") return `VOCABULARY MODE — A1-A2:
+- WORD CATEGORIES TO TEACH (rotate between them):
+  Family: mother, father, brother, sister, son, daughter, husband, wife, grandparents
+  Food: bread, milk, water, meat, fish, rice, fruit, vegetables, coffee, sugar
+  Home: kitchen, bedroom, bathroom, door, window, table, chair, bed, fridge
+  Body: head, hand, arm, leg, eye, ear, mouth, stomach
+  Daily life: school, work, bus, car, money, shop, hospital, bank
+  Adjectives: big, small, hot, cold, good, bad, new, old, cheap, expensive
+  Verbs: go, come, eat, drink, sleep, work, buy, want, need, like, have
+- NO phrasal verbs at this level. NO idioms.
+- FOLLOW THIS SEQUENCE FOR EACH WORD:
+  1. Say the English word clearly and slowly, then the Italian translation
+  2. Give a very simple example sentence: "I eat bread every morning"
+  3. Ask the learner to make their own sentence with that word
+  4. If they struggle, give them an Italian sentence to translate
+- Group words by theme (5-6 words per theme), then recap.`;
+
+    if (l === "C1-C2") return `VOCABULARY MODE — C1-C2:
+- WORD CATEGORIES TO TEACH (focus on sophistication and nuance):
+  Advanced phrasal verbs: come to terms with, get carried away, do away with, live up to, come up against, bring about, account for, dawn on, latch onto
+  Idioms and expressions: to be in the same boat, to bite the bullet, the elephant in the room, to go the extra mile, a blessing in disguise, to play it by ear, to cut corners, the ball is in your court
+  False friends for Italians: actually/attualmente, eventually/eventualmente, sensible/sensibile, pretend/pretendere, argument/argomento, sympathetic/simpatico, novel/novella, consistent/consistente
+  Register pairs: purchase/buy, commence/start, enquire/ask, reside/live, deceased/dead, intoxicated/drunk, perspire/sweat
+  Collocations: wreak havoc, forge a path, harbor doubts, wield influence, draw a conclusion, raise concerns, undergo surgery, reach a consensus
+  Connotation groups: slim/thin/skinny/scrawny, house/home/dwelling/residence, look/stare/gaze/glare/peek
+- SEQUENCE: present the word/expression, discuss its nuance and register, give a context where it's specifically better than a simpler alternative, ask the learner to use it in a sentence that captures the nuance.
+- Discuss word origins when interesting (Latin vs Germanic roots, loanwords).`;
+
+    return `VOCABULARY MODE — B1-B2:
+- WORD CATEGORIES TO TEACH (rotate between them):
+  Phrasal verbs (essential): look forward to, get along with, come across, turn out, figure out, give up, put off, bring up, set up, take after, run out of, break down, look into, get over, put up with, carry on, come up with, end up
+  Collocations: make a decision (not "do a decision"), do homework (not "make homework"), take a photo, catch a cold, pay attention, keep in touch, have a look, tell the truth, miss the point
+  False friends: actually (in realtà), eventually (alla fine), library (biblioteca), sensible (sensato), sympathetic (comprensivo), attend (partecipare), pretend (fingere)
+  Everyday idioms: break the ice, piece of cake, it's not my cup of tea, once in a blue moon, hit the nail on the head, cost an arm and a leg
+  Work vocabulary: deadline, meeting, report, colleague, salary, apply for, resign, hire, fire, promote
+  Travel: boarding pass, check in, gate, delay, accommodation, currency, exchange rate
+- SEQUENCE FOR EACH WORD:
+  1. Present the English word/phrasal verb with Italian translation
+  2. Give an Italian sentence using the concept
+  3. Ask the learner to translate it into English
+  4. If correct, move on. If not, explain and model the correct form.
+- After 5-6 words, do a quick recap.`;
+  }
+
+  if (activity === "quiz") {
+    if (l === "A1-A2") return `QUIZ & GAMES — A1-A2:
+- GAME TYPES (keep them very simple):
+  Translation flash: say a word in Italian, learner says it in English (casa→house, gatto→cat, acqua→water)
+  Yes or No: "Is 'dog' an animal? Is 'table' a food?" — very simple true/false
+  What's missing: "I ___ pizza" (like), "She ___ to school" (goes) — basic verb gaps
+  Choose one: "A or B? Do you SAY 'I have 20 years' or 'I am 20 years old'?" — common Italian mistakes
+  Opposite game: "What's the opposite of 'big'? Of 'hot'? Of 'happy'?"
+- Use only present simple, to be, to have in questions.
+- Explain every answer in Italian.
+- Give lots of encouragement: "Bravo!", "Perfetto!", "Quasi! La risposta era..."
+- Keep score and celebrate every point.`;
+
+    if (l === "C1-C2") return `QUIZ & GAMES — C1-C2:
+- GAME TYPES (challenging and nuanced):
+  Nuance challenge: give two similar words, learner explains the difference (efficient/effective, deny/refuse, convince/persuade, rob/steal, borrow/lend)
+  Register shift: give an informal sentence, learner rephrases it formally (and vice versa). "This idea sucks" → "This proposal has significant shortcomings"
+  Idiom origin: describe a situation, learner guesses the idiom. "When you finally accept a difficult truth" → "to bite the bullet"
+  Error forensics: give a sentence with a subtle error (often a false friend or register mistake), learner identifies AND explains it
+  Phrasal verb master: give a definition, learner produces the correct phrasal verb. "To tolerate something annoying" → "to put up with"
+  Spot the false friend: "The Italian politician's argument was very convincing" — is this correct? (Yes, but "argument" doesn't mean "argomento" in Italian)
+  Complete the collocation: "wreak ___" (havoc), "forge a ___" (path), "harbor ___" (doubts)
+- No score inflation — only award points for genuinely correct, nuanced answers.
+- When the learner gets it wrong, discuss WHY the error is common for Italian speakers.`;
+
+    return `QUIZ & GAMES — B1-B2:
+- GAME TYPES TO ROTATE:
+  Fill the Gap: sentences with missing phrasal verbs or collocations. "I'm really looking ___ to the holiday" (forward). "Can you ___ me a favour?" (do, not make)
+  Translation sprint: Italian sentences with tricky structures → English. "Vivo qui da 5 anni" → "I've lived here for 5 years" (NOT "I live here since 5 years")
+  False friend trap: give a sentence, learner spots the false friend usage. "I will eventually call you" — does this mean "eventualmente" or "alla fine"?
+  Odd One Out: "said, told, spoke, talked" — which one needs a direct object? (told)
+  Spot the Error: "She suggested me to go" (→ "She suggested I go" or "She suggested going"). Focus on typical Italian-speaker errors.
+  Word Association: say a word, learner gives a collocation. "Make" → "a decision, a mistake, friends, progress"
+- Keep score and announce it every 3-4 rounds.
+- After each wrong answer, explain the rule and give another similar question to reinforce.`;
+  }
+
+  if (activity === "traduci") {
+    if (l === "A1-A2") return `TRANSLATION MODE — A1-A2:
+- Translate very simple sentences between Italian and English.
+- When translating Italian→English, use only present simple, to be, to have. Avoid complex structures.
+- After each translation, highlight ONE grammar point in Italian:
+  "Ho 25 anni" → "I am 25 years old" — explain: in English we use "to be" for age, not "to have" as in Italian.
+  "Mi piace il gelato" → "I like ice cream" — explain: no article "the" before general concepts in English.
+- If the learner tries to translate something too complex, simplify it first: "Let's start with something easier: how would you say just the first part?"
+- Point out word-by-word translation traps that Italian speakers fall into.`;
+
+    if (l === "C1-C2") return `TRANSLATION MODE — C1-C2:
+- Handle complex, nuanced translations in both directions.
+- When translating, discuss multiple valid translations and their register/tone differences.
+- Highlight untranslatable concepts: Italian words with no English equivalent (abbiocco, meriggiare, dietrologia, arrangiarsi, magari as a response) and vice versa (serendipity, accountability, cringe, awkward).
+- Discuss how the same idea is expressed differently in the two cultures, not just languages.
+- For literary or formal text, discuss translation choices: literal vs free translation, domestication vs foreignization.
+- Point out when a translation "works" but sounds unnatural — suggest how a native would actually express the same idea.
+- Address common professional translation needs: email register, business proposals, academic abstracts.`;
+
+    return `TRANSLATION MODE — B1-B2:
+- Translate sentences of moderate complexity between Italian and English.
+- Focus on structures that Italian speakers typically get wrong:
+  Present perfect: "Studio inglese da 3 anni" → "I've been studying English for 3 years" (NOT "I study English since 3 years")
+  Conditional: "Se fossi ricco, comprerei una casa" → "If I were rich, I would buy a house"
+  Passive: "La pizza è stata inventata a Napoli" → "Pizza was invented in Naples"
+  Phrasal verbs: "L'ho scoperto per caso" → "I came across it by chance"
+- After each translation, point out the key structural difference between the Italian and English version.
+- When the learner translates, praise what's correct before correcting what's wrong.
+- Suggest more natural/idiomatic alternatives when the translation is correct but stiff.`;
+  }
+
+  return "";
 }
 
-interface RawExtractedChunk {
-  phrase: string;
-  translation: string;
-  context: string;
-  category?: string;
+
+const LEVEL_PROFILES: Record<string, string> = {
+  "A1-A2": `LEVEL A1-A2 — PRINCIPIANTE / ELEMENTARE
+SPEAKING SPEED: Very slow and clear. Pause between sentences.
+LANGUAGE MIX: 70% Italian, 30% English. Always translate English phrases into Italian right after.
+VOCABULARY: Only the 500 most common English words. No phrasal verbs, no idioms.
+GRAMMAR FOCUS: present simple (I go, he goes), to be, to have, articles (a/the), plurals, basic questions with do/does, there is/are, can/can't, basic prepositions (in, on, at).
+TOPICS: greetings, introductions, family, food, daily routine, numbers, colors, weather, time, shopping basics.
+CORRECTION STYLE: Correct every significant error. Repeat the correct form slowly, ask the learner to repeat it. Use Italian to explain why.
+SENTENCE LENGTH: Your English sentences must be max 6-8 words. One concept at a time.
+ENCOURAGEMENT: Praise frequently in Italian ("Bravo!", "Perfetto!", "Ci sei quasi!"). Make the learner feel safe to make mistakes.
+PATIENCE: Give the learner lots of time to think. If they struggle, offer the answer in Italian first, then in English.`,
+
+  "B1-B2": `LEVEL B1-B2 — INTERMEDIO / INTERMEDIO SUPERIORE
+SPEAKING SPEED: Moderate, natural rhythm but not too fast. Enunciate clearly.
+LANGUAGE MIX: 30% Italian, 70% English. Use Italian only to clarify complex grammar or abstract concepts.
+VOCABULARY: 2000-4000 words. Introduce common phrasal verbs (look up, get along, turn out), collocations (make a decision, take advantage), and everyday idioms (it's raining cats and dogs, break the ice).
+GRAMMAR FOCUS: present perfect vs past simple, future forms (will/going to/present continuous), first and second conditional, passive voice, relative clauses (who/which/that), reported speech, comparatives and superlatives, modal verbs for advice/obligation (should, must, have to).
+TOPICS: work, travel experiences, opinions, news, culture, health, education, technology, relationships, plans and ambitions.
+CORRECTION STYLE: Correct important errors that affect meaning. For minor errors, model the correct form naturally without interrupting ("Right, so you WENT there..."). Push the learner to self-correct ("Can you say that differently?").
+SENTENCE LENGTH: Use normal sentences (10-15 words). Introduce subordinate clauses.
+CHALLENGE: Ask open-ended questions. Push the learner to express opinions and justify them in English.`,
+
+  "C1-C2": `LEVEL C1-C2 — AVANZATO / PADRONANZA
+SPEAKING SPEED: Natural native speed. No simplification.
+LANGUAGE MIX: 95% English, 5% Italian — use Italian only for very specific linguistic comparisons between the two languages or to highlight a false friend.
+VOCABULARY: Full range. Use advanced collocations (undergo surgery, draw a conclusion), academic vocabulary, register variations (formal vs informal), nuanced synonyms, and sophisticated connectors (nevertheless, notwithstanding, insofar as).
+GRAMMAR FOCUS: mixed conditionals, inversion for emphasis (Not only did he..., Rarely have I...), cleft sentences (What I meant was..., It was John who...), advanced passive constructions, subjunctive (I suggest he go), discourse markers for academic/professional English.
+TOPICS: Any topic at depth — politics, philosophy, science, literature, economics, cultural nuances, humor, sarcasm, professional presentations, debate.
+CORRECTION STYLE: Focus on style, register, and nuance rather than grammar. Point out when something is "correct but unnatural" and suggest how a native would say it. Discuss connotations and subtle differences (e.g., "slim" vs "thin" vs "skinny").
+SENTENCE LENGTH: Full complexity. Use embedded clauses, parentheticals, hedging.
+CHALLENGE: Devil's advocate. Challenge the learner's arguments. Ask them to rephrase using more sophisticated structures. Discuss etymology and word origins when relevant.`,
+};
+
+function getLevelProfile(level: string): string {
+  return LEVEL_PROFILES[level] || LEVEL_PROFILES["B1-B2"];
 }
 
-function normalizePhraseKey(phrase: string): string {
-  return String(phrase || '')
-    .toLowerCase()
-    .normalize('NFKC')
-    .trim()
-    .replace(/[’`]/g, "'")
-    .replace(/^to\s+/i, '')
-    .replace(/[.,/#!$%^&*;:{}=\-_~()?"«»!@]/g, ' ')
-    .replace(/(^'+|'+$)/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function targetAppearsNaturally(text: string, target: string): boolean {
-  const normalizedText = normalizePhraseKey(text);
-  const normalizedTarget = normalizePhraseKey(target);
-  if (!normalizedText || !normalizedTarget) return false;
-  if ((` ${normalizedText} `).includes(` ${normalizedTarget} `)) return true;
-
-  if (normalizedTarget.startsWith('be ')) {
-    const complement = normalizedTarget.slice(3);
-    const forms = [
-      'am', 'is', 'are', 'was', 'were', 'been', 'being',
-      "i'm", "you're", "he's", "she's", "it's", "we're", "they're",
-      "isn't", "aren't", "wasn't", "weren't",
-    ];
-    return forms.some((form) => (` ${normalizedText} `).includes(` ${form} ${complement} `));
-  }
-
-  return false;
-}
-
-function deduplicateExtractedChunks(chunks: RawExtractedChunk[]): RawExtractedChunk[] {
-  const map = new Map<string, RawExtractedChunk>();
-
-  for (const item of chunks) {
-    if (!item || !item.phrase || typeof item.phrase !== 'string' || !item.phrase.trim()) {
-      continue;
-    }
-
-    const key = normalizePhraseKey(item.phrase);
-    if (!key) continue;
-
-    const existing = map.get(key);
-    if (!existing) {
-      map.set(key, {
-        phrase: item.phrase.trim(),
-        translation: (item.translation || '').trim(),
-        context: (item.context || item.phrase).trim(),
-        category: (item.category || 'Generale').trim(),
-      });
-    } else {
-      const newScore = (item.translation || '').length + (item.context || '').length;
-      const existingScore = (existing.translation || '').length + (existing.context || '').length;
-      if (newScore > existingScore) {
-        map.set(key, {
-          phrase: item.phrase.trim(),
-          translation: (item.translation || '').trim(),
-          context: (item.context || item.phrase).trim(),
-          category: (item.category || existing.category || 'Generale').trim(),
-        });
-      }
-    }
-  }
-
-  return Array.from(map.values());
-}
-
-// PDF Upload & Extraction Endpoint
-app.post("/api/upload-pdf", upload.single("pdfFile"), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: "Nessun file PDF caricato." });
-    }
-
-    console.log(`FILE PDF CARICATO: ${req.file.originalname} (${req.file.size} byte)`);
-
-    let extractedText = "";
-    try {
-      const pdfData = await pdfParse(req.file.buffer);
-      extractedText = pdfData.text || "";
-    } catch (parseErr) {
-      console.error("Errore durante il parsing del PDF con pdf-parse:", parseErr);
-      extractedText = req.file.buffer.toString("utf-8");
-    }
-
-    extractedText = extractedText.replace(/\s+/g, " ").trim();
-
-    if (!extractedText) {
-      extractedText = "Nessun testo leggibile estratto dal PDF.";
-    }
-
-    let rawChunks: RawExtractedChunk[] = [];
-    const textBlocks = splitTextIntoBlocks(extractedText, 10000, 400);
-    console.log(`PDF diviso in ${textBlocks.length} blocco/i di elaborazione.`);
-
-    const ai = getGeminiClient();
-
-    for (let i = 0; i < Math.min(textBlocks.length, 10); i++) {
-      const block = textBlocks[i];
-      try {
-        const prompt = `Analizza il seguente blocco di testo estratto da appunti/dispense di inglese per un apprendente italiano.
-Estrai TUTTE le espressioni utili, vocaboli chiave, phrasal verbs, collocazioni, idiomi o strutture grammaticali inglesi presenti nel testo.
-Per ciascun elemento identificato, fornisci:
-- phrase: l'espressione o parola in inglese (forma base/canonica)
-- translation: traduzione o spiegazione accurata in italiano in base al contesto
-- context: una frase di esempio chiara ed efficace in inglese che mostra l'uso dell'espressione
-- category: la categoria di appartenenza (es. Viaggi, Lavoro, Vita Quotidiana, Cibo, Grammatica, Idiomi)
-
-Estrai quanti più elementi utili reali trovi nel testo, senza tralasciare nulla di rilevante. Se un elemento appare con la sua traduzione nel testo, estrailo con precisione.
-
-Blocco di Testo PDF (${i + 1}/${textBlocks.length}):
-${block}`;
-
-        const aiRes = await callGeminiWithRetry(() =>
-          ai.models.generateContent({
-            model: "gemini-3.6-flash",
-            contents: prompt,
-            config: {
-              responseMimeType: "application/json",
-              responseSchema: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    phrase: { type: Type.STRING },
-                    translation: { type: Type.STRING },
-                    context: { type: Type.STRING },
-                    category: { type: Type.STRING },
-                  },
-                  required: ["phrase", "translation", "context"],
-                },
-              },
-            },
-          })
-        );
-
-        if (aiRes.text) {
-          const parsed = JSON.parse(aiRes.text);
-          if (Array.isArray(parsed)) {
-            rawChunks.push(...parsed);
-          }
-        }
-      } catch (blockErr) {
-        console.warn(`Estrazione fallita per il blocco ${i + 1}:`, blockErr);
-      }
-    }
-
-    const deduplicatedChunks = deduplicateExtractedChunks(rawChunks);
-    const indexedItemCount = deduplicatedChunks.length;
-
-    const documentData = {
-      id: `doc-${Date.now()}`,
-      fileName: req.file.originalname,
-      fileSize: req.file.size,
-      uploadedAt: new Date().toISOString(),
-      extractedText: extractedText.substring(0, 20000),
-      vocabularyCount: indexedItemCount, // ALWAYS synchronized with extractedChunks.length!
-      indexedItemCount: indexedItemCount,
-      indexingStatus: "ready" as const,
-      sourceItemEstimate: indexedItemCount,
-      extractedChunks: deduplicatedChunks.map((chunk, index) => ({
-        id: `chunk-up-${Date.now()}-${index}`,
-        phrase: chunk.phrase,
-        translation: chunk.translation,
-        context: chunk.context || chunk.phrase,
-        category: chunk.category || "Caricato da PDF",
-      })),
-    };
-
-    return res.json({ success: true, document: documentData });
-  } catch (error: any) {
-    console.error("Errore endpoint upload-pdf:", error);
-    return res.status(500).json({ error: error.message || "Errore nel caricamento del file PDF." });
-  }
-});
-
-// Helper function for tolerant parsing of vocabulary analysis responses
-function parseVocabularyAnalysisResponse(rawText: string, fallbackSelection: string, fallbackSentence: string) {
-  if (!rawText || typeof rawText !== "string") return null;
-
-  let cleaned = rawText.trim();
-  if (cleaned.startsWith("```")) {
-    cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
-  }
-
-  const firstBrace = cleaned.indexOf("{");
-  const lastBrace = cleaned.lastIndexOf("}");
-  if (firstBrace !== -1 && lastBrace > firstBrace) {
-    cleaned = cleaned.substring(firstBrace, lastBrace + 1);
-  }
-
-  try {
-    const obj = JSON.parse(cleaned);
-    const validTypes = ["word", "chunk", "phrasal_verb", "idiom", "collocation", "expression"];
-    const type = validTypes.includes(obj.type) ? obj.type : "expression";
-    const recommendedExpression = obj.recommendedExpression || obj.lemma || fallbackSelection;
-
-    const alternatives = Array.isArray(obj.alternativeSelections) && obj.alternativeSelections.length > 0
-      ? obj.alternativeSelections
-      : [
-          { text: fallbackSelection, type: "word" },
-          ...(recommendedExpression !== fallbackSelection ? [{ text: recommendedExpression, type }] : [])
-        ];
-
-    return {
-      selectedText: obj.selectedText || fallbackSelection,
-      recommendedExpression,
-      alternativeSelections: alternatives,
-      lemma: obj.lemma || recommendedExpression,
-      type,
-      translationIt: obj.translationIt || "Traduzione contestuale non disponibile",
-      contextualMeaningIt: obj.contextualMeaningIt || "",
-      pronunciationIpa: obj.pronunciationIpa || null,
-      originalSentence: obj.originalSentence || fallbackSentence,
-      exampleEnglish: obj.exampleEnglish || null,
-      exampleItalian: obj.exampleItalian || null,
-      cefrEstimate: obj.cefrEstimate || null,
-      tags: Array.isArray(obj.tags) ? obj.tags : [],
-      confidence: typeof obj.confidence === "number" ? obj.confidence : 0.9,
-    };
-  } catch (e) {
-    console.error("JSON parse error in parseVocabularyAnalysisResponse:", e, "Raw text:", rawText);
-    return null;
+function getSilenceDuration(level: string): number {
+  switch (level) {
+    case "A1-A2": return 10000;
+    case "B1-B2": return 6000;
+    case "C1-C2": return 3500;
+    default: return 6000;
   }
 }
 
-// Contextual Vocabulary Analysis Endpoint
-app.post("/api/vocabulary/analyze", async (req, res) => {
-  try {
-    const { selectedText, fullSentence, surroundingText, cefrLevel = "B1_B2", interfaceLanguage = "it" } = req.body;
+function buildSystemInstruction(activity: Activity, level: string): string {
+  return `You are a bilingual Italian-English conversation coach called "Madrelingua Coach" for an Italian learner of English.
 
-    if (!selectedText || typeof selectedText !== "string" || !selectedText.trim()) {
-      return res.status(400).json({
-        ok: false,
-        error: {
-          code: "INVALID_REQUEST",
-          message: "Parola selezionata obbligatoria.",
-          retryable: false
-        }
-      });
-    }
+${getLevelProfile(level)}
 
-    if (!fullSentence || typeof fullSentence !== "string" || !fullSentence.trim()) {
-      return res.status(400).json({
-        ok: false,
-        error: {
-          code: "INVALID_REQUEST",
-          message: "Frase completa obbligatoria.",
-          retryable: false
-        }
-      });
-    }
+CURRENT ACTIVITY: ${activity.toUpperCase()}
+${getActivityInstructions(activity, level)}
 
-    const trimmedSelection = selectedText.trim().slice(0, 100);
-    const trimmedSentence = fullSentence.trim().slice(0, 3000);
-
-    const ai = getGeminiClient();
-    const prompt = `You analyse English words and multi-word expressions for an Italian learner.
-
-Selected Text: "${trimmedSelection}"
-Full Sentence: "${trimmedSentence}"
-Learner CEFR Level: ${cefrLevel}
-
-Use the exact context supplied.
-The context may contain Italian and English.
-Identify whether the selected token belongs to a phrasal verb, chunk, collocation, idiom or fixed expression in this sentence.
-Prefer the complete useful expression when appropriate (e.g. if selection is "look" in "look it up", recommendedExpression is "look up").
-Do not include surrounding Italian words in the English expression.
-Return only valid JSON matching this schema:
-{
-  "selectedText": "${trimmedSelection}",
-  "recommendedExpression": "the base canonical expression or phrasal verb",
-  "alternativeSelections": [
-    { "text": "${trimmedSelection}", "type": "word" },
-    { "text": "recommendedExpression", "type": "phrasal_verb" }
-  ],
-  "lemma": "canonical base form",
-  "type": "word | chunk | phrasal_verb | idiom | collocation | expression",
-  "translationIt": "accurate Italian translation in context",
-  "contextualMeaningIt": "concise Italian explanation of nuance in context",
-  "pronunciationIpa": "IPA string or null",
-  "originalSentence": "${trimmedSentence}",
-  "exampleEnglish": "a simple clear new example sentence in English",
-  "exampleItalian": "Italian translation of example sentence",
-  "cefrEstimate": "A1 | A2 | B1 | B2 | C1",
-  "tags": ["tag1", "tag2"],
-  "confidence": 0.95
+SPEECH RULES:
+- Keep responses concise — no monologues. 2-3 sentences max per turn.
+- Be warm, encouraging, and patient like a real human tutor.
+- When the learner's speech is unclear, ask them to repeat briefly.
+- Never reference "the system", "your instructions", or "the activity mode".
+- The learner can interrupt you at any time — if interrupted, stop immediately and listen.
+- Act natural, as if you were a real person sitting across from them in a cafe.`;
 }
 
-Return only valid JSON. Do not use markdown code fences. Do not invent IPA (return null if uncertain). Keep Italian explanations concise and natural.`;
+function buildStartupPrompt(activity: Activity, level: string): string {
+  const levelHint = level === "A1-A2"
+    ? " Parla quasi tutto in italiano, usa solo parole inglesi semplicissime. Sii molto lento."
+    : level === "C1-C2"
+    ? " Speak mostly in English from the start. Be natural and dynamic."
+    : " Usa un mix di italiano e inglese. Parla a un ritmo moderato.";
 
-    let aiRes;
-    try {
-      aiRes = await callGeminiWithRetry(() =>
-        ai.models.generateContent({
-          model: "gemini-3.6-flash",
-          contents: prompt,
-          config: {
-            responseMimeType: "application/json",
-          },
-        })
-      );
-    } catch (firstErr: any) {
-      console.warn("[Vocab Analyze] First attempt failed, attempting simplified retry...", firstErr?.message);
-      const simplifiedPrompt = `Return JSON analysis for English expression "${trimmedSelection}" in sentence "${trimmedSentence}" for Italian learner.
-JSON format:
-{
-  "recommendedExpression": "${trimmedSelection}",
-  "type": "word",
-  "translationIt": "Italian translation",
-  "contextualMeaningIt": "Italian explanation",
-  "originalSentence": "${trimmedSentence}",
-  "exampleEnglish": "Example sentence",
-  "exampleItalian": "Traduzione esempio"
-}`;
-      aiRes = await callGeminiWithRetry(() =>
-        ai.models.generateContent({
-          model: "gemini-3.6-flash",
-          contents: simplifiedPrompt,
-        })
-      );
-    }
-
-    const rawText = aiRes?.text || "";
-    const parsedData = parseVocabularyAnalysisResponse(rawText, trimmedSelection, trimmedSentence);
-
-    if (!parsedData) {
-      return res.status(500).json({
-        ok: false,
-        error: {
-          code: "INVALID_MODEL_JSON",
-          message: "La risposta del modello non contiene un JSON valido.",
-          retryable: true
-        }
-      });
-    }
-
-    return res.json({
-      ok: true,
-      data: parsedData
-    });
-  } catch (error: any) {
-    console.error("Vocabulary analysis endpoint error:", error);
-    return res.status(500).json({
-      ok: false,
-      error: {
-        code: "MODEL_ERROR",
-        message: error.message || "Non sono riuscito ad analizzare questa espressione.",
-        retryable: true
-      }
-    });
+  switch (activity) {
+    case "conversazione":
+      return `Saluta in modo amichevole e fai una domanda aperta per iniziare la conversazione. Sii breve e naturale.${levelHint}`;
+    case "lezione":
+      return `Saluta brevemente e chiedi allo studente cosa vorrebbe imparare oggi. Proponi 2-3 argomenti come esempio.${levelHint}`;
+    case "vocabolario":
+      return `Saluta brevemente e inizia subito con la prima parola nuova. Segui la sequenza: presenta la parola inglese con traduzione italiana, poi fai una frase in italiano e chiedi la traduzione.${levelHint}`;
+    case "quiz":
+      return `Saluta con entusiasmo e proponi il primo gioco. Spiega brevemente le regole e inizia subito con la prima domanda.${levelHint}`;
+    case "traduci":
+      return `Saluta brevemente e di' allo studente che puo dirti o scriverti qualsiasi frase e tu la tradurrai. Chiedi cosa vuole tradurre.${levelHint}`;
   }
-});
-
-// Custom Topic Vocabulary Generation Endpoint
-app.post("/api/vocabulary/generate-custom-topic", async (req, res) => {
-  try {
-    const { topic, cefrLevel = "B1_B2", targetCount = 3, excludedExpressions = [] } = req.body;
-    if (!topic || typeof topic !== "string" || !topic.trim()) {
-      return res.status(400).json({ ok: false, error: "Argomento mancante" });
-    }
-
-    const cleanTopic = topic.trim();
-    const ai = getGeminiClient();
-
-    const prompt = `Sei un docente di inglese esperto per studenti italiani.
-Genera ${targetCount} target lessicali utili in inglese per un apprendente di livello ${cefrLevel} relativi all'argomento: "${cleanTopic}".
-
-PRIORITÀ OBBLIGATORIA:
-1. parole individuali e verbi utili;
-2. phrasal verbs;
-3. collocations;
-4. chunks ed espressioni brevi e naturali;
-5. idiomi frequenti, solo se davvero pertinenti.
-
-Non generare normali frasi complete da memorizzare o domande come target. Una formula completa è ammessa soltanto se funziona come un'unica breve espressione comunicativa. Non includere punteggiatura finale nel campo expression.
-
-ESCLUSIONS RIGIDE (NON usare nessuna di queste espressioni né loro forme base):
-${Array.isArray(excludedExpressions) ? excludedExpressions.slice(0, 100).join(", ") : ""}
-
-Per ciascun elemento, fornisci:
-- expression: il singolo target in inglese;
-- meaning: traduzione/spiegazione chiara in italiano;
-- usage: quando e come si usa in contesto;
-- example: una sola frase di esempio naturale in inglese;
-- type: 'word' | 'phrasal_verb' | 'collocation' | 'chunk' | 'idiom'.
-
-Restituisci un array JSON valido con gli elementi generati.`;
-
-    const aiRes = await callGeminiWithRetry(() =>
-      ai.models.generateContent({
-        model: "gemini-3.6-flash",
-        contents: prompt,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                expression: { type: Type.STRING },
-                meaning: { type: Type.STRING },
-                usage: { type: Type.STRING },
-                example: { type: Type.STRING },
-                type: { type: Type.STRING },
-              },
-              required: ["expression", "meaning", "usage", "example"],
-            },
-          },
-        },
-      })
-    );
-
-    let items: any[] = [];
-    if (aiRes.text) {
-      const parsed = JSON.parse(aiRes.text);
-      items = Array.isArray(parsed) ? parsed : [];
-    }
-
-    // Server-side hard barrier. The browser validates again before assigning
-    // currentItem, so Material exclusions are enforced independently twice.
-    const excludedKeys = new Set(
-      (Array.isArray(excludedExpressions) ? excludedExpressions : [])
-        .filter((value: unknown) => typeof value === "string")
-        .map((value: string) => normalizePhraseKey(value))
-        .filter(Boolean)
-    );
-    const seenKeys = new Set<string>();
-    const allowedTargetTypes = new Set(["word", "phrasal_verb", "collocation", "chunk", "idiom"]);
-    const safeItems = items.filter((item: any) => {
-      const expression = String(item?.expression || "").trim();
-      const key = normalizePhraseKey(expression);
-      const type = String(item?.type || "chunk").toLowerCase();
-      const wordCount = expression.split(/\s+/).filter(Boolean).length;
-      const looksLikeSentence = /[.!?]$/.test(expression) || wordCount > 9;
-      if (!key || excludedKeys.has(key) || seenKeys.has(key)) return false;
-      if (!allowedTargetTypes.has(type) || looksLikeSentence) return false;
-      if (!String(item?.meaning || "").trim() || !String(item?.example || "").trim()) return false;
-      seenKeys.add(key);
-      item.type = type;
-      return true;
-    }).slice(0, Math.max(1, Math.min(10, Number(targetCount) || 3)));
-
-    return res.json({ ok: true, topic: cleanTopic, items: safeItems });
-  } catch (err: any) {
-    console.error("Errore generazione custom topic:", err);
-    return res.status(500).json({ ok: false, error: err.message || "Errore durante la generazione dell'argomento." });
-  }
-});
-
-
-// Deterministic Vocabulary Exercise Generation Endpoint
-app.post("/api/vocabulary/create-exercise", async (req, res) => {
-  try {
-    const { currentItem, attemptNumber = 1, cefrLevel = "B1_B2", previousSentence = "" } = req.body || {};
-    const expression = String(currentItem?.expression || currentItem?.english || "").trim();
-    const meaning = String(currentItem?.meaning || currentItem?.italian || "").trim();
-    if (!expression || !currentItem?.id) {
-      return res.status(400).json({ ok: false, error: "Elemento target mancante." });
-    }
-
-    const ai = getGeminiClient();
-    const prompt = `Create one controlled Italian-to-English translation exercise for an Italian learner.
-CEFR level: ${cefrLevel}
-Mandatory English target: "${expression}"
-Italian meaning: "${meaning}"
-Usage: "${String(currentItem?.usage || "")}"
-Natural English example: "${String(currentItem?.example || "")}"
-Attempt number: ${Number(attemptNumber) || 1}
-Previous Italian sentence that MUST NOT be repeated: "${String(previousSentence || "")}"
-
-Return one realistic everyday Italian sentence whose most natural English translation requires the target expression in a grammatically correct form.
-Do not use metalinguistic wording such as "usa questa parola", "devo usare" or "frase relativa".
-The expected English translation must be complete, natural and contain the target expression or its necessary grammatical form, for example am/is/are for a target beginning with be.
-Return only JSON.`;
-
-    const response = await callGeminiWithRetry(() => ai.models.generateContent({
-      model: "gemini-3.6-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            italianSentence: { type: Type.STRING },
-            expectedEnglish: { type: Type.STRING },
-            acceptedAlternatives: { type: Type.ARRAY, items: { type: Type.STRING } },
-          },
-          required: ["italianSentence", "expectedEnglish"],
-        },
-      },
-    }));
-
-    const parsed = JSON.parse(response.text || "{}");
-    const italianSentence = String(parsed.italianSentence || "").trim();
-    const expectedEnglish = String(parsed.expectedEnglish || "").trim();
-    const normalizedTarget = normalizePhraseKey(expression);
-    if (
-      italianSentence.length < 8 || expectedEnglish.length < 8 ||
-      normalizePhraseKey(italianSentence) === normalizePhraseKey(String(previousSentence || "")) ||
-      !targetAppearsNaturally(expectedEnglish, normalizedTarget)
-    ) {
-      return res.status(422).json({ ok: false, error: "Esercizio generato non valido." });
-    }
-
-    return res.json({
-      ok: true,
-      exercise: {
-        id: `exercise_${currentItem.id}_${Date.now()}`,
-        italianSentence,
-        expectedEnglish,
-        acceptedAlternatives: Array.isArray(parsed.acceptedAlternatives)
-          ? parsed.acceptedAlternatives.filter((value: unknown) => typeof value === "string")
-          : [],
-        targetItemId: currentItem.id,
-        attemptNumber: Math.max(1, Number(attemptNumber) || 1),
-        answerWasRevealed: false,
-        createdAt: Date.now(),
-      },
-    });
-  } catch (error: any) {
-    console.warn("Controlled exercise generation failed:", error?.message || error);
-    return res.status(500).json({ ok: false, error: error?.message || "Generazione esercizio non riuscita." });
-  }
-});
-
-// Structured Translation Evaluation Endpoint
-app.post("/api/vocabulary/evaluate-translation", async (req, res) => {
-  try {
-    const { userAnswer, currentItem, assignedTranslationExercise, cefrLevel = "B1_B2" } = req.body || {};
-    const target = String(currentItem?.expression || currentItem?.english || "").trim();
-    const answer = String(userAnswer || "").trim();
-    const italianSentence = String(assignedTranslationExercise?.italianSentence || "").trim();
-    const expectedEnglish = String(assignedTranslationExercise?.expectedEnglish || "").trim();
-    if (!target || !answer || !italianSentence || !expectedEnglish) {
-      return res.status(400).json({ ok: false, error: "Dati di valutazione incompleti." });
-    }
-
-    const ai = getGeminiClient();
-    const prompt = `Evaluate one Italian-to-English translation attempt.
-Learner CEFR: ${cefrLevel}
-Italian sentence assigned: "${italianSentence}"
-Expected natural translation: "${expectedEnglish}"
-Canonical target expression: "${target}"
-Learner answer: "${answer}"
-
-A correct answer must express the assigned meaning, use the target correctly in a grammatical form and be a coherent sentence.
-Do not mark it correct merely because it contains the target substring.
-Give a score from 4 to 10 and a concise Italian explanation. Return only JSON.`;
-
-    const response = await callGeminiWithRetry(() => ai.models.generateContent({
-      model: "gemini-3.6-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            correct: { type: Type.BOOLEAN },
-            score: { type: Type.INTEGER },
-            correctedEnglish: { type: Type.STRING },
-            explanationItalian: { type: Type.STRING },
-            targetUsedCorrectly: { type: Type.BOOLEAN },
-          },
-          required: ["correct", "score", "correctedEnglish", "explanationItalian", "targetUsedCorrectly"],
-        },
-      },
-    }));
-    const parsed = JSON.parse(response.text || "{}");
-    const answerWasRevealed = Boolean(assignedTranslationExercise?.answerWasRevealed);
-    return res.json({
-      ok: true,
-      assessment: {
-        correct: Boolean(parsed.correct),
-        score: Math.max(4, Math.min(10, Number(parsed.score) || 4)),
-        correctedEnglish: String(parsed.correctedEnglish || expectedEnglish),
-        explanationItalian: String(parsed.explanationItalian || "Valutazione completata."),
-        targetUsedCorrectly: Boolean(parsed.targetUsedCorrectly),
-        independentlyProduced: Boolean(parsed.correct) && !answerWasRevealed,
-      },
-    });
-  } catch (error: any) {
-    console.warn("Structured translation evaluation failed:", error?.message || error);
-    return res.status(500).json({ ok: false, error: error?.message || "Valutazione non riuscita." });
-  }
-});
-
-// Silent State Evaluator Endpoint
-app.post("/api/learning-state/update", async (req, res) => {
-  try {
-    const {
-      currentRuntimeState,
-      learningMode = "free_conversation",
-      latestUserMessage,
-      latestAssistantMessage,
-      currentItem,
-      cefrLevel = "B1_B2",
-    } = req.body;
-
-    if (!currentRuntimeState) {
-      return res.status(400).json({ error: "State mancante" });
-    }
-
-    const ai = getGeminiClient();
-
-    const evaluationPrompt = `Analizza la seguente interazione tra l'apprendente e il coach d'inglese.
-Modalità Didattica: ${learningMode}
-Livello CEFR: ${cefrLevel}
-Elemento Corrente Target: ${JSON.stringify(currentItem || {})}
-Messaggio Utente: "${latestUserMessage || ''}"
-Risposta Coach: "${latestAssistantMessage || ''}"
-
-Valuta e aggiorna lo stato pedagogico strutturato:
-1. userStopRequested: boolean (true se l'utente ha pronunciato un comando esplicito di arresto o pausa come "stop", "terminiamo", "basta", "cambia attività", "mettiamo in pausa", "pausa")
-2. answerAssessment:
-   - correct: boolean (se la risposta dell'utente è corretta o comprensibile)
-   - score: numero intero da 4 a 10 (10=perfetto/naturale, 9=piccola imperfezione, 8=corretto ma poco naturale, 7=comprensibile con un errore, 6=diversi errori ma significato chiaro, 5=parzialmente chiaro, 4=errore grave/non pertinente). Mai sotto 4.
-   - neededHint: boolean (se l'utente ha avuto bisogno di un indizio per rispondere)
-3. currentItemCompleted: boolean (se l'elemento o esercizio corrente si può considerare completato con successo)
-4. currentPhase: stringa descrittiva della fase attuale (es. "presentation", "explanation", "comprehension", "production", "correction", "application", "retrieval", "active_recall", "conversation")
-5. waitingFor: cosa si aspetta dal prossimo turno dell'utente ("none", "english_word", "italian_meaning", "sentence_translation", "spoken_answer", "multiple_choice", "confirmation")
-6. recentError: se l'utente ha commesso un errore rilevante, estrailo come oggetto { original, correction, explanation, category }. Altrimenti null.
-7. introducedVocabularyItem: se il coach ha introdotto una nuova espressione o vocabolo utile, estraila come oggetto { english, italian, type, example }. Altrimenti null.`;
-
-    const evalRes = await callGeminiWithRetry(() =>
-      ai.models.generateContent({
-        model: "gemini-3.6-flash",
-        contents: evaluationPrompt,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              userStopRequested: { type: Type.BOOLEAN },
-              currentPhase: { type: Type.STRING },
-              waitingFor: { type: Type.STRING },
-              answerAssessment: {
-                type: Type.OBJECT,
-                properties: {
-                  correct: { type: Type.BOOLEAN },
-                  score: { type: Type.INTEGER },
-                  neededHint: { type: Type.BOOLEAN },
-                },
-                required: ["correct", "score"],
-              },
-              currentItemCompleted: { type: Type.BOOLEAN },
-              recentError: {
-                type: Type.OBJECT,
-                properties: {
-                  original: { type: Type.STRING },
-                  correction: { type: Type.STRING },
-                  explanation: { type: Type.STRING },
-                  category: { type: Type.STRING },
-                },
-              },
-              introducedVocabularyItem: {
-                type: Type.OBJECT,
-                properties: {
-                  english: { type: Type.STRING },
-                  italian: { type: Type.STRING },
-                  type: { type: Type.STRING },
-                  example: { type: Type.STRING },
-                },
-              },
-            },
-            required: ["currentPhase", "waitingFor", "answerAssessment", "currentItemCompleted"],
-          },
-        },
-      })
-    );
-
-    const evalData = JSON.parse(evalRes.text || "{}");
-
-    // Construct updated state while keeping invariant fields intact
-    const updatedState = { ...currentRuntimeState };
-
-    if (evalData.userStopRequested) {
-      updatedState.exerciseStatus = 'stopped';
-      updatedState.activityStatus = 'paused';
-    } else {
-      updatedState.exerciseStatus = 'active';
-      if (updatedState.activityStatus === 'not_started' || updatedState.activityStatus === 'introducing') {
-        updatedState.activityStatus = 'waiting_for_user';
-      }
-    }
-
-    if (evalData.currentPhase) updatedState.currentPhase = evalData.currentPhase;
-    if (evalData.waitingFor) updatedState.waitingFor = evalData.waitingFor;
-
-    if (evalData.answerAssessment) {
-      updatedState.lastScore = evalData.answerAssessment.score;
-    }
-
-    // Handle learning_games runtime state update
-    if (learningMode === 'learning_games' || updatedState.learningMode === 'learning_games') {
-      const existingGame = updatedState.gameRuntimeState || {
-        schemaVersion: 1,
-        appSessionId: updatedState.appSessionId || "session",
-        learningMode: "learning_games",
-        gameType: updatedState.gameType || "quick_translation",
-        status: "waiting_for_user",
-        roundNumber: 1,
-        targetRounds: 5,
-        source: updatedState.gameContentSource || "free_topic",
-        score: 0,
-        correctAnswers: 0,
-        partiallyCorrectAnswers: 0,
-        incorrectAnswers: 0,
-        currentDifficulty: "medium",
-        usedItemIds: [],
-        recentMistakes: [],
-        updatedAt: new Date().toISOString(),
-      };
-
-      if (evalData.answerAssessment) {
-        if (evalData.answerAssessment.score >= 8) {
-          existingGame.score += 2;
-          existingGame.correctAnswers += 1;
-        } else if (evalData.answerAssessment.score >= 6) {
-          existingGame.score += 1;
-          existingGame.partiallyCorrectAnswers += 1;
-        } else {
-          existingGame.incorrectAnswers += 1;
-        }
-      }
-
-      if (evalData.currentItemCompleted) {
-        existingGame.roundNumber += 1;
-      }
-
-      // Do NOT set game status to "completed" automatically - exercise stays active until user stops
-      if (evalData.userStopRequested) {
-        existingGame.status = "paused";
-      } else {
-        existingGame.status = "waiting_for_user";
-      }
-
-      existingGame.updatedAt = new Date().toISOString();
-      updatedState.gameRuntimeState = existingGame;
-      updatedState.gameType = existingGame.gameType;
-    }
-
-    if (evalData.currentItemCompleted) {
-      updatedState.completedItemCount = (updatedState.completedItemCount || 0) + 1;
-      if (currentItem && currentItem.english) {
-        if (!updatedState.completedItemIds.includes(currentItem.english)) {
-          updatedState.completedItemIds.push(currentItem.english);
-        }
-      }
-    }
-
-    if (evalData.recentError && evalData.recentError.original) {
-      updatedState.recentErrors = [
-        ...(updatedState.recentErrors || []),
-        evalData.recentError,
-      ].slice(-10);
-    }
-
-    if (evalData.introducedVocabularyItem && evalData.introducedVocabularyItem.english) {
-      const exists = (updatedState.sessionVocabulary || []).some(
-        (v: any) => v.english.toLowerCase() === evalData.introducedVocabularyItem.english.toLowerCase()
-      );
-      if (!exists) {
-        updatedState.sessionVocabulary = [
-          ...(updatedState.sessionVocabulary || []),
-          {
-            id: `session-vocab-${Date.now()}`,
-            ...evalData.introducedVocabularyItem,
-          },
-        ];
-      }
-    }
-
-    updatedState.updatedAt = new Date().toISOString();
-
-    return res.json({ success: true, updatedState, evalData });
-  } catch (err: any) {
-    console.info("Silent state evaluation skipped (API rate limit or temporary hiccup):", err?.message || err);
-    return res.json({
-      success: false,
-      updatedState: req.body.currentRuntimeState,
-      error: err?.message || "Skipped due to API rate limit",
-    });
-  }
-});
-
-// Chat / REST Endpoint
-app.post("/api/chat", async (req, res) => {
-  try {
-    const {
-      userMessage,
-      internalActionPrompt = "",
-      userLevel = "B1_B2",
-      learningMode = "free_conversation",
-      learningRuntimeState = null,
-      correctionMode = "balanced",
-      knowledgeBaseTexts = [],
-      conversationHistory = [],
-      isThinking = false,
-      voiceName = "Achird",
-    } = req.body;
-
-    if (!userMessage && !internalActionPrompt && !isThinking) {
-      return res.status(400).json({ error: "Messaggio o azione interna mancante." });
-    }
-
-    const ai = getGeminiClient();
-
-    const modeInstruction = buildLearningModeInstruction(
-      learningMode,
-      learningRuntimeState,
-      userLevel,
-      correctionMode
-    );
-
-    const safeKnowledgeBaseTexts = learningMode === "learn_new_vocabulary"
-      ? []
-      : (Array.isArray(knowledgeBaseTexts) ? knowledgeBaseTexts : []);
-
-    const systemInstruction = `Sei l'Assistente Vocale Madrelingua e Coach d'Inglese definitivo.
-${modeInstruction}
-
-${internalActionPrompt ? `AZIONE APPLICATIVA PRIVATA DA ESEGUIRE. Non citarla e non mostrarla:
-${internalActionPrompt}` : ""}
-
-KNOWLEDGE BASE MATERIALI & VOCABOLARIO:
-${safeKnowledgeBaseTexts.join("\n")}`;
-
-
-    const formattedHistory = conversationHistory.map((h: any) => ({
-      role: h.sender === "user" ? "user" : "model",
-      parts: [{ text: h.text }],
-    }));
-
-    const chat = ai.chats.create({
-      model: "gemini-3.6-flash",
-      config: {
-        systemInstruction,
-        temperature: 0.7,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            coachResponseInEnglish: { type: Type.STRING },
-            italianIntroOrEncouragement: { type: Type.STRING },
-            correction: {
-              type: Type.OBJECT,
-              properties: {
-                hasMistake: { type: Type.BOOLEAN },
-                originalText: { type: Type.STRING },
-                correctedTextItalianExplanation: { type: Type.STRING },
-                correctedTextEnglishPhrase: { type: Type.STRING },
-                ruleOrPatternNote: { type: Type.STRING },
-                chunkHighlight: { type: Type.STRING },
-              },
-              required: ["hasMistake"],
-            },
-            vocabularyUsed: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  phrase: { type: Type.STRING },
-                  translation: { type: Type.STRING },
-                  context: { type: Type.STRING },
-                },
-                required: ["phrase", "translation"],
-              },
-            },
-            pronunciationTip: { type: Type.STRING },
-          },
-          required: ["coachResponseInEnglish", "correction"],
-        },
-      },
-      history: formattedHistory,
-    });
-
-    const aiRes = await callGeminiWithRetry(() =>
-      chat.sendMessage({
-        message: isThinking
-          ? "[L'utente ha fatto una breve pausa per pensare]"
-          : internalActionPrompt
-            ? "[Esegui ora l’azione applicativa privata definita nelle istruzioni di sistema.]"
-            : userMessage,
-      })
-    );
-
-    const parsedData = JSON.parse(aiRes.text || "{}");
-
-    let audioBase64: string | null = null;
-    let audioMimeType: string = "audio/pcm;rate=24000";
-
-    try {
-      const textToSpeak = parsedData.coachResponseInEnglish;
-      if (textToSpeak && textToSpeak.trim()) {
-        const ttsRes = await callGeminiWithRetry(() =>
-          ai.models.generateContent({
-            model: "gemini-3.1-flash-tts-preview",
-            contents: [{ parts: [{ text: textToSpeak }] }],
-            config: {
-              responseModalities: ["AUDIO"],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName: voiceName || "Achird" },
-                },
-              },
-            },
-          })
-        );
-
-        const part = ttsRes.candidates?.[0]?.content?.parts?.[0];
-        if (part?.inlineData?.data) {
-          audioBase64 = part.inlineData.data;
-          if (part.inlineData.mimeType) {
-            audioMimeType = part.inlineData.mimeType;
-          }
-        }
-      }
-    } catch (ttsErr: any) {
-      console.warn("Gemini TTS audio note:", ttsErr?.message || ttsErr);
-    }
-
-    return res.json({
-      success: true,
-      data: parsedData,
-      audioBase64,
-      audioMimeType,
-    });
-  } catch (error: any) {
-    console.error("Errore endpoint chat:", error);
-    return res.status(500).json({ error: error.message || "Errore nella comunicazione con il Coach AI." });
-  }
-});
-
-// Endpoint per la classificazione deterministica dell'intento vocale dell'attività
-app.post("/api/activity-route", async (req, res) => {
-  try {
-    const { text, currentMode } = req.body;
-    if (!text || typeof text !== "string") {
-      return res.status(400).json({ intent: "unknown", confidence: 0 });
-    }
-
-    const ai = getGeminiClient();
-    const prompt = `Sei un classificatore di intenti per un'app di apprendimento dell'inglese per utenti italiani.
-Analizza la frase pronunciata dall'utente e determina quale attività desidera svolgere.
-
-Le quattro attività disponibili sono:
-1. 'free_conversation' (conversazione libera, parlare liberamente in inglese)
-2. 'knowledge_review' (ripassare le proprie parole salvate, materiale personale, vocaboli)
-3. 'learn_new_vocabulary' (imparare nuove parole ed espressioni, esplorare un nuovo argomento o topic pack)
-4. 'learning_games' (fare un gioco linguistico, quiz, sfide)
-
-Altre azioni possibili:
-- 'change_activity' (l'utente dice "cambia attività", "cambiamo esercizio", "voglio fare qualcos'altro", "basta questo")
-- 'stop' (l'utente dice "stop", "pausa", "terminiamo", "basta")
-- 'unknown' (la frase non indica chiaramente un cambio o una scelta di attività)
-
-Input utente: "${text}"
-Modalità attuale: "${currentMode || 'free_conversation'}"
-
-Rispondi rigorosamente ed ESCLUSIVAMENTE in formato JSON con la seguente struttura:
-{
-  "intent": "free_conversation" | "knowledge_review" | "learn_new_vocabulary" | "learning_games" | "change_activity" | "stop" | "unknown",
-  "confidence": 0.95,
-  "reason": "Spiegazione breve"
-}`;
-
-    const response = await callGeminiWithRetry(() =>
-      ai.models.generateContent({
-        model: "gemini-3.6-flash",
-        contents: prompt,
-        config: { responseMimeType: "application/json" },
-      })
-    );
-
-    const parsed = JSON.parse(response.text || "{}");
-    return res.json(parsed);
-  } catch (err: any) {
-    console.warn("Errore /api/activity-route fallback unknown:", err?.message);
-    return res.json({ intent: "unknown", confidence: 0, reason: err?.message });
-  }
-});
-
-// Endpoint per la generazione dinamica di vocaboli da Topic Pack
-app.post("/api/topic-vocabulary/generate", async (req, res) => {
-  try {
-    const {
-      packId,
-      moduleId,
-      competencyAreaId,
-      cefrLevel = "B1",
-      targetCount = 3,
-      existingExpressions = [],
-      excludedExpressions = []
-    } = req.body;
-
-    const allExclusions = Array.from(new Set([...existingExpressions, ...excludedExpressions]));
-
-    const ai = getGeminiClient();
-    const prompt = `Genera esattamente ${targetCount} nuovi elementi di vocabolario target (parole, chunk, phrasal verbs o espressioni utili) in inglese per un docente di inglese.
-Livello CEFR target: ${cefrLevel}.
-Topic Pack: ${packId || "generale"}, Modulo: ${moduleId || "generale"}, Area di Competenza: ${competencyAreaId || "generale"}.
-
-IMPORTANTE: NON includere nessuna delle seguenti espressioni escluse/già note all'utente:
-${JSON.stringify(allExclusions)}
-
-Fornisci la risposta ESCLUSIVAMENTE in formato JSON come array di oggetti con questo schema:
-[
-  {
-    "id": "gen_item_1",
-    "expression": "Espressione in inglese",
-    "meaningIt": "Traduzione/significato in italiano",
-    "usageIt": "Nota d'uso breve in italiano",
-    "exampleEnglish": "Frase di esempio in inglese",
-    "type": "word|chunk|phrasal_verb|collocation|idiom|grammar_pattern",
-    "difficulty": "${cefrLevel}"
-  }
-]`;
-
-    const response = await callGeminiWithRetry(() =>
-      ai.models.generateContent({
-        model: "gemini-3.6-flash",
-        contents: prompt,
-        config: { responseMimeType: "application/json" },
-      })
-    );
-
-    const items = JSON.parse(response.text || "[]");
-    return res.json({ success: true, items: Array.isArray(items) ? items : [] });
-  } catch (err: any) {
-    console.error("Errore /api/topic-vocabulary/generate:", err);
-    return res.status(500).json({ success: false, items: [], error: err?.message });
-  }
-});
-
-// Create HTTP and WebSocket Server
+}
+
+function sendText(liveSession: any, text: string) {
+  liveSession.sendClientContent({
+    turns: [{ role: "user", parts: [{ text }] }],
+    turnComplete: true,
+  });
+}
+
+// ── WebSocket relay ─────────────────────────────────────────────
 const httpServer = http.createServer(app);
 const wss = new WebSocketServer({ server: httpServer, path: "/api/live-ws" });
 
-  interface ServerSessionData {
-  appSessionId: string;
-  sessionStartReason?: string;
-  resumptionHandle?: string;
-  initialCoachTurnSent?: boolean;
-  liveSessionReady?: boolean;
-  startupTurnPending?: boolean;
-  customStartupPrompt?: string;
-  learningMode?: string;
-  learningRuntimeState?: any;
-  lastUpdated: number;
-  currentTransitionId?: number;
-  deferInitialCoachTurn?: boolean;
-  teacherTurnStarted?: boolean;
-  interruptedTeacherTurnId?: string;
-  teacherTurnSequence?: number;
+interface SessionData {
+  activity: Activity;
+  level: string;
+  voiceName: string;
+  turnMode: "free" | "push_to_talk";
+  liveSessionReady: boolean;
+  initialTurnSent: boolean;
+  teacherTurnActive: boolean;
   currentTeacherTurnId?: string;
-  currentTeacherTransitionId?: number;
-  lastTeacherPrompt?: string;
-  level?: string;
-  correctionMode?: string;
-  topic?: string;
-  knowledgeText?: string;
-  turnMode?: string;
-}
-const serverSessions = new Map<string, ServerSessionData>();
-
-function executeInitialCoachTurn(liveSession: any, clientWs: WebSocket, sessionObj: ServerSessionData, customPrompt?: string) {
-  if (sessionObj.initialCoachTurnSent || !liveSession) return;
-  if (sessionObj.sessionStartReason === 'technical_reconnect') {
-    sessionObj.initialCoachTurnSent = true;
-    sessionObj.startupTurnPending = false;
-    return;
-  }
-  sessionObj.initialCoachTurnSent = true;
-  sessionObj.startupTurnPending = false;
-
-  if (clientWs.readyState === WebSocket.OPEN) {
-    clientWs.send(
-      JSON.stringify({
-        type: "initial_coach_turn_accepted",
-        appSessionId: sessionObj.appSessionId,
-        transitionId: sessionObj.currentTransitionId,
-      })
-    );
-  }
-
-  let startupPrompt = customPrompt || sessionObj.customStartupPrompt;
-  const isFreshSession = sessionObj.sessionStartReason === 'fresh_session';
-  const isActivitySelection = sessionObj.learningMode === 'activity_selection';
-
-  if (!startupPrompt) {
-    if (isFreshSession || isActivitySelection) {
-      startupPrompt = "This is a brand-new activity-selection opening. Speak only in Italian. Ignore and do not mention any previous conversation, saved phrases, Materials, travel, business, meetings or role-play. Say exactly this sentence and nothing else: \"Ciao! Sono il tuo assistente madrelingua per l’inglese. Oggi possiamo fare una conversazione libera, ripassare le tue parole, imparare nuove parole ed espressioni oppure fare un gioco linguistico. Cosa scegli?\" Do not paraphrase it and do not ask any other question.";
-    } else {
-      const mode = sessionObj.learningMode || "activity_selection";
-      if (mode === "activity_selection") {
-        startupPrompt = "This is a brand-new activity-selection opening. Speak only in Italian. Ignore and do not mention any previous conversation, saved phrases, Materials, travel, business, meetings or role-play. Say exactly this sentence and nothing else: \"Ciao! Sono il tuo assistente madrelingua per l’inglese. Oggi possiamo fare una conversazione libera, ripassare le tue parole, imparare nuove parole ed espressioni oppure fare un gioco linguistico. Cosa scegli?\" Do not paraphrase it and do not ask any other question.";
-      } else if (mode === "knowledge_review") {
-        startupPrompt = "Conferma brevemente che inizierete il ripasso delle sue parole e presenta il primo elemento senza chiedere nuovamente quale attività vuole fare.";
-      } else if (mode === "learn_new_vocabulary") {
-        if (sessionObj.learningRuntimeState?.activeModuleId || sessionObj.learningRuntimeState?.currentItem) {
-          startupPrompt = "Inizia immediatamente la micro-lezione dal primo elemento selezionato. Non ripresentare il menu e non chiedere di cosa vuole parlare.";
-        } else {
-          startupPrompt = getMacroTopicOverview().formattedPromptPanorama;
-        }
-      } else if (mode === "learning_games") {
-        startupPrompt = "Conferma che farete un gioco linguistico e presenta la prima sfida.";
-      } else {
-        startupPrompt = "Saluta in inglese o italiano in modo informale e inizia la conversazione libera con una domanda aperta in inglese per rompere il ghiaccio.";
-      }
-    }
-  }
-
-  sessionObj.lastTeacherPrompt = startupPrompt || '';
-  console.log(`[Dev Diag] Triggering initial coach turn via sendRealtimeInput for session ${sessionObj.appSessionId}`);
-
-  const sendStartupPrompt = () => {
-    liveSession.sendRealtimeInput({
-      text: startupPrompt,
-    });
-  };
-
-  try {
-    // Gemini 3.1 Live accepts conversational text through realtime input.
-    // sendClientContent is reserved for seeding initial history and can leave
-    // a fresh voice session waiting forever without producing a teacher turn.
-    sendStartupPrompt();
-  } catch (stErr: any) {
-    console.warn("First attempt of initial coach turn trigger failed, retrying in 500ms:", stErr?.message);
-    setTimeout(() => {
-      try {
-        if (liveSession && clientWs.readyState === WebSocket.OPEN) {
-          sendStartupPrompt();
-        }
-      } catch (retryErr) {
-        console.error("Second attempt of initial coach turn trigger failed:", retryErr);
-        if (clientWs.readyState === WebSocket.OPEN) {
-          clientWs.send(JSON.stringify({
-            type: "initial_coach_turn_failed",
-            error: retryErr instanceof Error ? retryErr.message : "Startup turn failed",
-          }));
-        }
-      }
-    }, 500);
-  }
+  turnSequence: number;
+  resumptionHandle?: string;
+  audioChunksReceived?: number;
+  reconnecting: boolean;
+  reconnectAttempts: number;
+  ended: boolean;
 }
 
 wss.on("connection", (clientWs: WebSocket) => {
-  console.log("⚡ Client connesso a Gemini Live WebSocket");
+  console.log("[WS] Client connesso");
   let liveSession: any = null;
-  let currentAppSessionId: string | null = null;
+  let session: SessionData | null = null;
 
-  clientWs.on("message", async (rawMessage: Buffer) => {
+  async function connectToGemini(ai: GoogleGenAI, sess: SessionData, isReconnect: boolean) {
+    const { activity, level, voiceName, turnMode } = sess;
+    const silenceMs = getSilenceDuration(level);
+    const tag = isReconnect ? "[RECONNECT]" : "[GEMINI]";
+    console.log(`${tag} VAD: silenceDurationMs=${silenceMs} level=${level}`);
+
+    const realtimeInputConfig: any = turnMode === "push_to_talk"
+      ? {
+          automaticActivityDetection: { disabled: true },
+          activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+        }
+      : {
+          automaticActivityDetection: {
+            disabled: false,
+            startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
+            endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_LOW,
+            prefixPaddingMs: 300,
+            silenceDurationMs: silenceMs,
+          },
+          activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+        };
+
+    const systemInstruction = buildSystemInstruction(activity, level);
+    const sessionResumption = isReconnect && sess.resumptionHandle
+      ? { handle: sess.resumptionHandle }
+      : undefined;
+
+    console.log(`${tag} Connecting to gemini-3.1-flash-live-preview...${sessionResumption ? " (with resumption handle)" : ""}`);
+
     try {
-      const msg = JSON.parse(rawMessage.toString());
-
-      if (msg.type === "init") {
-        const {
-          appSessionId = "default_session",
-          sessionStartReason = "fresh_session",
-          resumptionHandle: clientRequestedHandle,
-          recentHistory,
-          voiceName = "Achird",
-          level = "Intermediate",
-          topic = "General conversation",
-          learningMode = "activity_selection",
-          learningRuntimeState = null,
-          correctionMode = "balanced",
-          knowledgeText,
-          turnMode = "automatic",
-          pauseToleranceSeconds = 5,
-          forceFreshModelContext = false,
-          deferInitialCoachTurn = false,
-          transitionId = 0,
-          initialActionPrompt,
-        } = msg;
-
-        currentAppSessionId = appSessionId;
-        let existingSession = serverSessions.get(appSessionId);
-        if (!existingSession) {
-          existingSession = { appSessionId, lastUpdated: Date.now() };
-          serverSessions.set(appSessionId, existingSession);
-        }
-
-        existingSession.sessionStartReason = sessionStartReason;
-        existingSession.learningMode = learningMode;
-        existingSession.learningRuntimeState = learningRuntimeState;
-        existingSession.level = level;
-        existingSession.correctionMode = correctionMode;
-        existingSession.topic = topic;
-        existingSession.knowledgeText = learningMode === 'learn_new_vocabulary' ? '' : (knowledgeText || '');
-        existingSession.turnMode = turnMode;
-        existingSession.currentTransitionId = transitionId;
-        existingSession.deferInitialCoachTurn = Boolean(deferInitialCoachTurn);
-        if (initialActionPrompt) {
-          existingSession.customStartupPrompt = initialActionPrompt;
-        }
-
-        if (deferInitialCoachTurn || forceFreshModelContext) {
-          existingSession.initialCoachTurnSent = false;
-          existingSession.teacherTurnStarted = false;
-          existingSession.startupTurnPending = false;
-          existingSession.liveSessionReady = false;
-        }
-
-        if (forceFreshModelContext) {
-          existingSession.resumptionHandle = undefined;
-        }
-
-        const effectiveHandle = forceFreshModelContext
-          ? undefined
-          : clientRequestedHandle || existingSession.resumptionHandle;
-        const isResuming = Boolean(effectiveHandle);
-
-        const ai = getGeminiClient();
-
-        const effectivePauseSeconds = Math.min(
-          8,
-          Math.max(3, Number(pauseToleranceSeconds) || 5)
-        );
-        const silenceDurationMs = Math.round(effectivePauseSeconds * 1000);
-
-        let realtimeInputConfig: any;
-        if (turnMode === "tap_to_talk") {
-          realtimeInputConfig = {
-            automaticActivityDetection: {
-              disabled: true,
-            },
-            activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
-          };
-        } else if (turnMode === "noise_resistant") {
-          realtimeInputConfig = {
-            automaticActivityDetection: {
-              disabled: false,
-              startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_LOW,
-              endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_LOW,
-              prefixPaddingMs: 600,
-              silenceDurationMs,
-            },
-            activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
-          };
-        } else {
-          // "automatic" — LOW sensitivity + high prefix padding. The client now
-          // mutes mic outbound while the coach speaks, so echo-triggered
-          // self-interruptions are eliminated. The generous prefixPaddingMs
-          // ensures that any residual ambient noise when the mic unmutes
-          // doesn't immediately trigger Gemini's VAD.
-          realtimeInputConfig = {
-            automaticActivityDetection: {
-              disabled: false,
-              startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_LOW,
-              endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_LOW,
-              prefixPaddingMs: 500,
-              silenceDurationMs,
-            },
-            activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
-          };
-        }
-
-        // System Instruction using unified buildLearningModeInstruction
-        const modeInstruction = buildLearningModeInstruction(
-          learningMode,
-          learningRuntimeState,
-          level,
-          correctionMode
-        );
-
-        const systemInstruction = `You are a bilingual Italian-English conversation coach for an Italian learner of English.
-
-FRESH ACTIVITY-SELECTION SAFETY:
-- When learningMode is activity_selection, the opening turn must be entirely in Italian.
-- Never mention, infer or reuse previous sessions, saved phrases, Materials, travel, business, meetings or role-play unless the learner explicitly introduces them in the current session.
-- A fresh session has no conversational memory.
-
-${modeInstruction}
-
-SPEECH AND TRANSCRIPTION CONTEXT:
-- The learner normally speaks Italian or English and may switch between them.
-- Treat short Italian confirmations such as "sì", "no", "va bene" and "dimmi tu" as valid complete turns.
-- Do not reinterpret an isolated short Italian reply as another writing system or an unrelated language.
-- When the transcript is unclear, ask for a brief repetition instead of inventing content.
-
-Topic Focus / Scenario: ${topic}
-${learningMode !== 'learn_new_vocabulary' && knowledgeText ? `- Student Materials & Vocabulary:\n${knowledgeText}` : ""}`;
-
-
-        // Format history fallback if not resuming and history exists
-        let historyTurns: Array<{ role: "user" | "model"; parts: Array<{ text: string }> }> = [];
-        if (
-          !isResuming &&
-          sessionStartReason !== 'fresh_session' &&
-          learningMode !== 'activity_selection' &&
-          Array.isArray(recentHistory) &&
-          recentHistory.length > 0
-        ) {
-          const filtered = recentHistory
-            .filter((m: any) => m && (m.sender === "user" || m.sender === "coach") && typeof m.text === "string" && m.text.trim().length > 0)
-            .slice(-12);
-
-          let totalChars = 0;
-          const pruned: Array<{ sender: "user" | "coach"; text: string }> = [];
-          for (let i = filtered.length - 1; i >= 0; i--) {
-            const item = filtered[i];
-            if (totalChars + item.text.length > 8000) break;
-            totalChars += item.text.length;
-            pruned.unshift(item);
-          }
-
-          let lastRole: "user" | "model" | null = null;
-          for (const item of pruned) {
-            const role: "user" | "model" = item.sender === "user" ? "user" : "model";
-            if (role !== lastRole) {
-              historyTurns.push({
-                role,
-                parts: [{ text: item.text.trim() }],
-              });
-              lastRole = role;
-            }
-          }
-        }
-
-        const liveConfig: any = {
+      liveSession = await ai.live.connect({
+        model: "gemini-3.1-flash-live-preview",
+        config: {
           responseModalities: [Modality.AUDIO],
           inputAudioTranscription: {},
           outputAudioTranscription: {},
           speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: {
-                voiceName: voiceName || "Achird",
-              },
-            },
+            voiceConfig: { prebuiltVoiceConfig: { voiceName } },
           },
           realtimeInputConfig,
           systemInstruction,
-          sessionResumption: {
-            handle: effectiveHandle || undefined,
+          contextWindowCompression: { slidingWindow: {} },
+          sessionResumption,
+        },
+        callbacks: {
+          onmessage: (liveMsg: LiveServerMessage) => {
+            if (!session) return;
+
+            if (liveMsg.sessionResumptionUpdate?.resumable && liveMsg.sessionResumptionUpdate.newHandle) {
+              session.resumptionHandle = liveMsg.sessionResumptionUpdate.newHandle;
+            }
+
+            if (liveMsg.goAway) {
+              console.log("[GEMINI] GoAway received — will auto-reconnect");
+              send({ type: "reconnecting" });
+              attemptReconnect();
+              return;
+            }
+
+            if (liveMsg.setupComplete) {
+              console.log(`${tag} Setup complete — session ready`);
+              session.liveSessionReady = true;
+              session.reconnecting = false;
+              session.reconnectAttempts = 0;
+              if (isReconnect) {
+                send({ type: "reconnected" });
+              } else {
+                send({ type: "setup_complete" });
+              }
+              if (!session.initialTurnSent) {
+                triggerInitialTurn();
+              }
+            }
+
+            const parts = liveMsg.serverContent?.modelTurn?.parts;
+            if (parts) {
+              if (!session.teacherTurnActive) {
+                session.teacherTurnActive = true;
+                session.turnSequence++;
+                session.currentTeacherTurnId = `t_${session.turnSequence}_${Date.now()}`;
+                console.log(`[GEMINI] Teacher turn started: ${session.currentTeacherTurnId}`);
+                send({ type: "teacher_turn_started", teacherTurnId: session.currentTeacherTurnId });
+              }
+              for (const part of parts) {
+                if (part.inlineData?.data) {
+                  send({ type: "audio", data: part.inlineData.data, mimeType: part.inlineData.mimeType || "audio/pcm;rate=24000", teacherTurnId: session.currentTeacherTurnId });
+                }
+                if (part.text) {
+                  send({ type: "teacher_transcript", text: part.text, teacherTurnId: session.currentTeacherTurnId });
+                }
+              }
+            }
+
+            const coachText = liveMsg.serverContent?.outputTranscription?.text;
+            if (coachText) {
+              send({ type: "teacher_transcript", text: coachText, teacherTurnId: session.currentTeacherTurnId });
+            }
+
+            const userText = liveMsg.serverContent?.inputTranscription?.text;
+            if (userText) {
+              send({ type: "user_transcript", text: userText });
+            }
+
+            if (liveMsg.serverContent?.interrupted) {
+              console.log("[GEMINI] Interrupted");
+              const id = session.currentTeacherTurnId;
+              session.teacherTurnActive = false;
+              session.currentTeacherTurnId = undefined;
+              send({ type: "interrupted", teacherTurnId: id });
+            }
+
+            if (liveMsg.serverContent?.turnComplete) {
+              console.log("[GEMINI] Turn complete");
+              const id = session.currentTeacherTurnId;
+              session.teacherTurnActive = false;
+              session.currentTeacherTurnId = undefined;
+              send({ type: "turn_complete", teacherTurnId: id });
+            }
           },
-          contextWindowCompression: {
-            slidingWindow: {},
+          onclose: () => {
+            console.log(`${tag} Connection closed (ready=${session?.liveSessionReady}, ended=${session?.ended})`);
+            if (session && !session.ended && session.liveSessionReady) {
+              console.log("[GEMINI] Unexpected close — attempting reconnect");
+              send({ type: "reconnecting" });
+              attemptReconnect();
+            } else if (!session?.liveSessionReady) {
+              send({ type: "error", error: "Sessione chiusa prima dell'avvio. Verifica la API key." });
+              send({ type: "session_closed" });
+            }
           },
+          onerror: (err: any) => {
+            console.error(`${tag} Error:`, err?.message || err);
+            send({ type: "error", error: err?.message || "Errore sessione Gemini" });
+          },
+        },
+      });
+
+      console.log(`${tag} Connection established, liveSession assigned`);
+      if (!isReconnect) {
+        send({ type: "connected", activity, level, turnMode, voiceName });
+      }
+
+      if (session.liveSessionReady && !session.initialTurnSent) {
+        console.log(`${tag} setupComplete already fired before connect resolved — triggering initial turn now`);
+        triggerInitialTurn();
+      }
+    } catch (connErr: any) {
+      console.error(`${tag} Connection FAILED:`, connErr?.message || connErr);
+      if (isReconnect && session && session.reconnectAttempts < 3) {
+        const delay = 2000 * (session.reconnectAttempts + 1);
+        console.log(`${tag} Will retry in ${delay}ms (attempt ${session.reconnectAttempts + 1}/3)`);
+        setTimeout(() => attemptReconnect(), delay);
+      } else {
+        send({ type: "error", error: connErr.message || "Impossibile connettersi al servizio vocale" });
+        send({ type: "session_closed" });
+      }
+    }
+  }
+
+  async function attemptReconnect() {
+    if (!session || session.ended || clientWs.readyState !== WebSocket.OPEN) return;
+    if (session.reconnectAttempts >= 3) {
+      console.log("[RECONNECT] Max attempts reached — giving up");
+      send({ type: "error", error: "Impossibile riconnettersi. Riavvia la sessione." });
+      send({ type: "session_closed" });
+      return;
+    }
+    session.reconnecting = true;
+    session.reconnectAttempts++;
+    session.liveSessionReady = false;
+    session.teacherTurnActive = false;
+    session.currentTeacherTurnId = undefined;
+    if (liveSession) {
+      try { liveSession.close(); } catch (e) {}
+      liveSession = null;
+    }
+    console.log(`[RECONNECT] Attempt ${session.reconnectAttempts}/3 (handle=${session.resumptionHandle ? "yes" : "no"})`);
+    try {
+      const ai = getGeminiClient();
+      await connectToGemini(ai, session, true);
+    } catch (err: any) {
+      console.error("[RECONNECT] Failed:", err?.message);
+    }
+  }
+
+  clientWs.on("message", async (raw: Buffer) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+
+      if (msg.type === "init") {
+        const activity: Activity = msg.activity || "conversazione";
+        const level = msg.level || "A1-A2";
+        const voiceName = msg.voiceName || "Achird";
+        const turnMode = msg.turnMode || "free";
+
+        console.log(`[INIT] activity=${activity} level=${level} voice=${voiceName} mode=${turnMode}`);
+
+        session = {
+          activity,
+          level,
+          voiceName,
+          turnMode,
+          liveSessionReady: false,
+          initialTurnSent: false,
+          teacherTurnActive: false,
+          turnSequence: 0,
+          reconnecting: false,
+          reconnectAttempts: 0,
+          ended: false,
         };
 
-        if (!isResuming && historyTurns.length > 0) {
-          liveConfig.historyConfig = {
-            initialHistoryInClientContent: true,
-          };
-        }
-
+        let ai: GoogleGenAI;
         try {
-          liveSession = await ai.live.connect({
-            model: "gemini-3.1-flash-live-preview",
-            config: liveConfig,
-            callbacks: {
-              onmessage: (liveMsg: LiveServerMessage) => {
-                // 0. Session Resumption & GoAway Handling
-                if (liveMsg.sessionResumptionUpdate) {
-                  const sru = liveMsg.sessionResumptionUpdate;
-                  if (sru.resumable && sru.newHandle) {
-                    existingSession!.resumptionHandle = sru.newHandle;
-                    existingSession!.lastUpdated = Date.now();
-                    if (clientWs.readyState === WebSocket.OPEN) {
-                      clientWs.send(
-                        JSON.stringify({
-                          type: "session_resumption_update",
-                          resumable: true,
-                          hasHandle: true,
-                        })
-                      );
-                    }
-                  } else if (sru.resumable === false) {
-                    if (clientWs.readyState === WebSocket.OPEN) {
-                      clientWs.send(
-                        JSON.stringify({
-                          type: "session_resumption_update",
-                          resumable: false,
-                          hasHandle: Boolean(existingSession!.resumptionHandle),
-                        })
-                      );
-                    }
-                  }
-                }
-
-                if (liveMsg.goAway) {
-                  const timeLeft = liveMsg.goAway.timeLeft || "unknown";
-                  console.log(`[Gemini Live] GoAway received. Time left: ${timeLeft}`);
-                  if (clientWs.readyState === WebSocket.OPEN) {
-                    clientWs.send(
-                      JSON.stringify({
-                        type: "go_away",
-                        timeLeft,
-                        hasHandle: Boolean(existingSession!.resumptionHandle),
-                      })
-                    );
-                  }
-                }
-
-                if (liveMsg.setupComplete) {
-                  existingSession!.liveSessionReady = true;
-                  if (clientWs.readyState === WebSocket.OPEN) {
-                    clientWs.send(
-                      JSON.stringify({
-                        type: "setup_complete",
-                        transitionId: existingSession!.currentTransitionId,
-                      })
-                    );
-                  }
-
-                  if (existingSession!.startupTurnPending && !existingSession!.initialCoachTurnSent) {
-                    console.log(`[LiveHandoff] Executing pending startup turn upon setup_complete for transition #${existingSession!.currentTransitionId}`);
-                    executeInitialCoachTurn(liveSession, clientWs, existingSession!, existingSession!.customStartupPrompt);
-                  } else if (existingSession!.deferInitialCoachTurn) {
-                    console.log(`[LiveHandoff] Deferring initial coach turn for transition #${existingSession!.currentTransitionId}`);
-                  } else if (!isResuming && historyTurns.length > 0 && liveSession) {
-                    try {
-                      liveSession.sendClientContent({
-                        turns: historyTurns,
-                        turnComplete: true,
-                      });
-                      if (clientWs.readyState === WebSocket.OPEN) {
-                        clientWs.send(
-                          JSON.stringify({
-                            type: "history_fallback_executed",
-                            messageCount: historyTurns.length,
-                          })
-                        );
-                      }
-                    } catch (hErr) {
-                      console.warn("Failed to send history fallback turns:", hErr);
-                    }
-                  } else if (!isResuming && historyTurns.length === 0 && liveSession) {
-                    if (
-                      !existingSession!.deferInitialCoachTurn &&
-                      existingSession!.startupTurnPending &&
-                      !existingSession!.initialCoachTurnSent
-                    ) {
-                      executeInitialCoachTurn(liveSession, clientWs, existingSession!);
-                    }
-                  }
-                }
-
-                // 1. Model Audio Response stream
-                const parts = liveMsg.serverContent?.modelTurn?.parts;
-                if (parts) {
-                  if (!existingSession!.teacherTurnStarted) {
-                    existingSession!.teacherTurnStarted = true;
-                    existingSession!.teacherTurnSequence = (existingSession!.teacherTurnSequence || 0) + 1;
-                    existingSession!.currentTeacherTurnId = `teacher_${existingSession!.teacherTurnSequence}_${Date.now()}`;
-                    existingSession!.currentTeacherTransitionId = existingSession!.currentTransitionId;
-                    if (clientWs.readyState === WebSocket.OPEN) {
-                      clientWs.send(
-                        JSON.stringify({
-                          type: "teacher_turn_started",
-                          transitionId: existingSession!.currentTeacherTransitionId,
-                          teacherTurnId: existingSession!.currentTeacherTurnId,
-                        })
-                      );
-                    }
-                  }
-                  for (const part of parts) {
-                    if (part.inlineData?.data) {
-                      clientWs.send(
-                        JSON.stringify({
-                          type: "audio",
-                          data: part.inlineData.data,
-                          mimeType: part.inlineData.mimeType || "audio/pcm;rate=24000",
-                          teacherTurnId: existingSession!.currentTeacherTurnId,
-                          transitionId: existingSession!.currentTeacherTransitionId,
-                        })
-                      );
-                    }
-                    if (part.text) {
-                      clientWs.send(
-                        JSON.stringify({
-                          type: "teacher_transcript",
-                          text: part.text,
-                          teacherTurnId: existingSession!.currentTeacherTurnId,
-                          transitionId: existingSession!.currentTeacherTransitionId,
-                        })
-                      );
-                    }
-                  }
-                }
-
-                // 2. Output Audio Transcription (Coach)
-                const coachText = liveMsg.serverContent?.outputTranscription?.text;
-                if (coachText) {
-                  clientWs.send(
-                    JSON.stringify({
-                      type: "teacher_transcript",
-                      text: coachText,
-                      teacherTurnId: existingSession!.currentTeacherTurnId,
-                      transitionId: existingSession!.currentTeacherTransitionId,
-                    })
-                  );
-                }
-
-                // 3. Input Audio Transcription (User) from Gemini Live
-                const userText = liveMsg.serverContent?.inputTranscription?.text;
-                if (userText) {
-                  const isStartupTriggerText = userText.includes("Start this new voice session now") || userText.includes("[SYSTEM_STARTUP_TRIGGER]");
-                  if (!isStartupTriggerText) {
-                    clientWs.send(
-                      JSON.stringify({
-                        type: "user_transcript",
-                        text: userText,
-                      })
-                    );
-                  }
-                }
-
-                // 4. Interrupted event
-                if (liveMsg.serverContent?.interrupted) {
-                  const interruptedId = existingSession!.currentTeacherTurnId;
-                  existingSession!.interruptedTeacherTurnId = interruptedId;
-                  existingSession!.teacherTurnStarted = false;
-                  existingSession!.currentTeacherTurnId = undefined;
-                  clientWs.send(JSON.stringify({
-                    type: "interrupted",
-                    teacherTurnId: interruptedId,
-                    transitionId: existingSession!.currentTeacherTransitionId,
-                  }));
-                }
-
-                // 5. Turn complete event
-                if (liveMsg.serverContent?.turnComplete) {
-                  const completedTeacherTurnId = existingSession!.currentTeacherTurnId || existingSession!.interruptedTeacherTurnId;
-                  existingSession!.teacherTurnStarted = false;
-                  if (clientWs.readyState === WebSocket.OPEN) {
-                    clientWs.send(
-                      JSON.stringify({
-                        type: "teacher_turn_completed",
-                        transitionId: existingSession!.currentTeacherTransitionId,
-                        teacherTurnId: completedTeacherTurnId,
-                      })
-                    );
-                  }
-                  existingSession!.currentTeacherTurnId = undefined;
-                  existingSession!.currentTeacherTransitionId = undefined;
-                  existingSession!.interruptedTeacherTurnId = undefined;
-                }
-              },
-              onclose: () => {
-                if (clientWs.readyState === WebSocket.OPEN) {
-                  // A close before setup ever completed means the upstream Gemini Live
-                  // connection was rejected (bad/missing API key, quota, model unavailable,
-                  // etc.) rather than ended gracefully. The client has no handler for a bare
-                  // "session_closed" and would otherwise sit silently until the generic
-                  // startup watchdog times out ~16s later. Surface it immediately as an
-                  // error so the client's existing reconnect/error UI kicks in right away.
-                  if (!existingSession!.liveSessionReady) {
-                    clientWs.send(JSON.stringify({
-                      type: "error",
-                      error: "La sessione Gemini Live si è chiusa prima di completare l'avvio. Verifica che GEMINI_API_KEY sia configurata correttamente.",
-                    }));
-                  }
-                  clientWs.send(JSON.stringify({ type: "session_closed" }));
-                }
-              },
-              onerror: (err: any) => {
-                console.error("Gemini Live Session Error:", err);
-                if (clientWs.readyState === WebSocket.OPEN) {
-                  clientWs.send(JSON.stringify({ type: "error", error: err?.message || "Live session error" }));
-                }
-              },
-            },
-          });
-
-          clientWs.send(
-            JSON.stringify({
-              type: "connected",
-              serverPauseToleranceSeconds: effectivePauseSeconds,
-              silenceDurationMs,
-              serverReceivedLevel: level,
-              levelProfileInjected: level,
-              appSessionId,
-              isResumed: isResuming,
-              hasHandle: Boolean(existingSession.resumptionHandle),
-              contextWindowCompressionActive: true,
-            })
-          );
-        } catch (connErr: any) {
-          console.error("Live session connect error:", connErr);
-          clientWs.send(
-            JSON.stringify({ type: "error", error: connErr.message || "Impossibile avviare Gemini Live API" })
-          );
+          ai = getGeminiClient();
+        } catch (keyErr: any) {
+          console.error("[INIT] API key error:", keyErr.message);
+          send({ type: "error", error: keyErr.message });
+          return;
         }
-      } else if (msg.type === "request_initial_coach_turn") {
-        const sess = currentAppSessionId ? serverSessions.get(currentAppSessionId) : null;
-        if (sess) {
-          if (msg.transitionId !== undefined && sess.currentTransitionId !== undefined && msg.transitionId < sess.currentTransitionId) {
-            console.log(`[LiveHandoff] Obsolete request_initial_coach_turn for transition #${msg.transitionId} (current: #${sess.currentTransitionId})`);
-            return;
-          }
-          if (msg.initialActionPrompt) {
-            sess.customStartupPrompt = msg.initialActionPrompt;
-          }
-          if (sess.liveSessionReady && liveSession) {
-            executeInitialCoachTurn(liveSession, clientWs, sess, msg.initialActionPrompt);
-          } else {
-            sess.startupTurnPending = true;
-          }
+
+        await connectToGemini(ai, session, false);
+      }
+
+      else if (msg.type === "audio" && liveSession) {
+        if (!session) return;
+        if (!session.audioChunksReceived) session.audioChunksReceived = 0;
+        session.audioChunksReceived++;
+        if (session.audioChunksReceived % 50 === 1) {
+          console.log(`[AUDIO] Chunk #${session.audioChunksReceived} received from client, size=${msg.data?.length || 0} chars`);
         }
-      } else if (msg.type === "context_update" && liveSession) {
-        const sess = currentAppSessionId ? serverSessions.get(currentAppSessionId) : null;
-        if (!sess) return;
-        sess.learningMode = msg.learningMode || sess.learningMode;
-        sess.learningRuntimeState = msg.learningRuntimeState || sess.learningRuntimeState;
-        sess.topic = msg.topic || sess.topic;
-        sess.knowledgeText = sess.learningMode === 'learn_new_vocabulary' ? '' : String(msg.knowledgeText || sess.knowledgeText || '');
-        sess.currentTransitionId = Number(msg.transitionId || 0);
-        sess.customStartupPrompt = String(msg.initialActionPrompt || '');
-        // Send ONLY the short action prompt to Gemini, not the entire learning
-        // mode instruction set. The system instruction already contains the full
-        // mode details — re-sending hundreds of lines as "user input" confused
-        // Gemini into restarting its response mid-stream.
-        sess.lastTeacherPrompt = sess.customStartupPrompt
-          ? `[ACTIVITY_SWITCH] Mode: ${sess.learningMode || 'activity_selection'}. ${sess.customStartupPrompt}`
-          : `[ACTIVITY_SWITCH] Mode: ${sess.learningMode || 'activity_selection'}. Procedi con l'attività indicata nelle tue istruzioni di sistema.`;
-        sess.initialCoachTurnSent = false;
-        // Preserve any in-flight teacher turn ID and its original transition.
-        // Late chunks from that turn remain attributable and are discarded by the client.
-        sess.interruptedTeacherTurnId = undefined;
-        if (clientWs.readyState === WebSocket.OPEN) {
-          clientWs.send(JSON.stringify({
-            type: "context_update_accepted",
-            transitionId: sess.currentTransitionId,
-          }));
-        }
-        if (sess.lastTeacherPrompt) {
-          liveSession.sendRealtimeInput({ text: sess.lastTeacherPrompt });
-        }
-      } else if (msg.type === "retry_teacher_turn" && liveSession) {
-        const sess = currentAppSessionId ? serverSessions.get(currentAppSessionId) : null;
-        if (!sess) return;
-        const actionPrompt = String(
-          msg.initialActionPrompt ||
-          sess.customStartupPrompt ||
-          'Respond to the learner’s latest turn in the current active activity.'
-        ).trim();
-        sess.currentTransitionId = Number(msg.transitionId ?? sess.currentTransitionId ?? 0);
-        sess.teacherTurnStarted = false;
-        sess.currentTeacherTurnId = undefined;
-        sess.currentTeacherTransitionId = undefined;
-        sess.interruptedTeacherTurnId = undefined;
-        const retryPrompt = `[AUDIO_RETRY] ${actionPrompt} Produce a complete SPOKEN audio response now.`;
-        sess.lastTeacherPrompt = retryPrompt;
-        liveSession.sendRealtimeInput({ text: retryPrompt });
-      } else if (msg.type === "session_end") {
-        if (currentAppSessionId) {
-          serverSessions.delete(currentAppSessionId);
-        }
-        if (liveSession) {
-          try {
-            liveSession.close();
-          } catch (e) {}
-          liveSession = null;
-        }
-      } else if (msg.type === "audio" && liveSession) {
-        liveSession.sendRealtimeInput({
-          audio: {
-            data: msg.data,
-            mimeType: "audio/pcm;rate=16000",
-          },
-        });
-      } else if (msg.type === "text" && liveSession) {
-        liveSession.sendRealtimeInput({
-          text: msg.text,
-        });
-      } else if (msg.type === "activity_start" && liveSession) {
-        liveSession.sendRealtimeInput({
-          activityStart: {},
-        });
-      } else if (msg.type === "activity_end" && liveSession) {
-        liveSession.sendRealtimeInput({
-          activityEnd: {},
-        });
-      } else if (msg.type === "audio_stream_end" && liveSession) {
-        liveSession.sendRealtimeInput({
-          audioStreamEnd: true,
-        });
-      } else if (msg.type === "interrupt" && liveSession) {
-        let interruptedId = msg.teacherTurnId;
-        if (currentAppSessionId) {
-          const sess = serverSessions.get(currentAppSessionId);
-          if (sess) {
-            interruptedId = interruptedId || sess.currentTeacherTurnId;
-            sess.interruptedTeacherTurnId = interruptedId || "current";
-            // Keep the current turn identity until Gemini emits interrupted or
-            // turnComplete, so every late chunk remains traceable and rejectable.
-          }
-        }
-        if (clientWs.readyState === WebSocket.OPEN) {
-          clientWs.send(
-            JSON.stringify({
-              type: "teacher_turn_interrupted",
-              teacherTurnId: interruptedId,
-            })
-          );
+        liveSession.sendRealtimeInput({ audio: { data: msg.data, mimeType: "audio/pcm;rate=16000" } });
+      }
+
+      else if (msg.type === "text" && liveSession) {
+        console.log("[TEXT] User sent text:", msg.text.slice(0, 50));
+        sendText(liveSession, msg.text);
+      }
+
+      else if (msg.type === "activity_start" && liveSession) {
+        liveSession.sendRealtimeInput({ activityStart: {} });
+      }
+      else if (msg.type === "activity_end" && liveSession) {
+        liveSession.sendRealtimeInput({ activityEnd: {} });
+      }
+      else if (msg.type === "audio_stream_end" && liveSession) {
+        liveSession.sendRealtimeInput({ audioStreamEnd: true });
+      }
+
+      else if (msg.type === "interrupt" && liveSession) {
+        console.log("[INTERRUPT] Coach interrupted by user");
+        if (session) {
+          const id = session.currentTeacherTurnId;
+          session.teacherTurnActive = false;
+          session.currentTeacherTurnId = undefined;
+          send({ type: "interrupted", teacherTurnId: id });
         }
       }
+
+      else if (msg.type === "change_activity" && liveSession && session) {
+        const newActivity: Activity = msg.activity || "conversazione";
+        session.activity = newActivity;
+        if (msg.level) session.level = msg.level;
+        console.log(`[ACTIVITY] Switched to: ${newActivity}`);
+        sendText(liveSession, `[ACTIVITY_SWITCH] The learner wants to switch to: ${newActivity}. ${buildStartupPrompt(newActivity, session.level)}`);
+      }
+
+      else if (msg.type === "change_level" && liveSession && session) {
+        session.level = msg.level || session.level;
+        console.log(`[LEVEL] Changed to: ${session.level}`);
+        sendText(liveSession, `[LEVEL_CHANGE] The learner's level is now: ${session.level}. Adapt your English complexity accordingly from now on. Confirm the change briefly in Italian.`);
+      }
+
+      else if (msg.type === "retry_teacher_turn" && liveSession) {
+        console.log("[RETRY] Audio retry requested");
+        sendText(liveSession, "[AUDIO_RETRY] Please respond with audio now.");
+      }
+
+      else if (msg.type === "session_end") {
+        console.log("[SESSION] End requested");
+        if (session) session.ended = true;
+        if (liveSession) {
+          try { liveSession.close(); } catch (e) {}
+          liveSession = null;
+        }
+        session = null;
+      }
     } catch (e: any) {
-      console.error("WebSocket message processing error:", e);
+      console.error("[WS] Message error:", e?.message || e);
     }
   });
 
   clientWs.on("close", () => {
+    console.log("[WS] Client disconnected");
     if (liveSession) {
-      try {
-        liveSession.close();
-      } catch (e) {}
+      try { liveSession.close(); } catch (e) {}
+      liveSession = null;
     }
+    session = null;
   });
+
+  function send(data: any) {
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(JSON.stringify(data));
+    }
+  }
+
+  function triggerInitialTurn() {
+    if (!session || session.initialTurnSent || !liveSession) return;
+    session.initialTurnSent = true;
+    const prompt = buildStartupPrompt(session.activity, session.level);
+    console.log("[INITIAL] Sending startup prompt for:", session.activity);
+    try {
+      sendText(liveSession, prompt);
+      console.log("[INITIAL] Startup prompt sent successfully");
+    } catch (err: any) {
+      console.error("[INITIAL] Startup prompt FAILED:", err?.message);
+      setTimeout(() => {
+        try {
+          if (liveSession && clientWs.readyState === WebSocket.OPEN) {
+            sendText(liveSession, prompt);
+            console.log("[INITIAL] Retry succeeded");
+          }
+        } catch (retryErr: any) {
+          console.error("[INITIAL] Retry FAILED:", retryErr?.message);
+          send({ type: "error", error: "Impossibile avviare la sessione vocale." });
+        }
+      }, 1000);
+    }
+  }
 });
 
-// Setup Vite Development Middleware or Static Production Serving
+// ── Server startup ──────────────────────────────────────────────
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -1879,13 +686,14 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get("*", (req, res) => {
+    app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
   httpServer.listen(PORT, "0.0.0.0", () => {
-    console.log(`🚀 Madrelingua AI Coach attivo su http://localhost:${PORT}`);
+    console.log(`Madrelingua Coach attivo su http://localhost:${PORT}`);
+    console.log(`API key: ${GEMINI_API_KEY ? "configurata" : "MANCANTE"}`);
   });
 }
 

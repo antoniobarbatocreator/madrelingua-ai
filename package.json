@@ -2,6 +2,9 @@
   "name": "madrelingua-ai-coach-inglese",
   "private": true,
   "version": "1.4.0",
+  "engines": {
+    "node": "22.x"
+  },
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",

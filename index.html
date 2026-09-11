@@ -1,34 +1,34 @@
 <!doctype html>
-<html lang="it" class="h-full bg-slate-950">
+<html lang="it" class="h-full">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
     <title>Madrelingua - English Coach</title>
     <meta name="description" content="Il tuo coach madrelingua per imparare l'inglese con conversazione naturale e correzioni in tempo reale." />
-    
+
     <!-- PWA Manifest & Theme -->
     <link rel="manifest" href="/manifest.json" />
-    <meta name="theme-color" content="#020617" />
-    <meta name="background-color" content="#020617" />
-    
+    <meta name="theme-color" content="#F5F0EA" />
+    <meta name="background-color" content="#F5F0EA" />
+
     <!-- iOS / Apple Meta Tags & Icons -->
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="Madrelingua" />
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
     <link rel="apple-touch-icon-precomposed" sizes="180x180" href="/apple-touch-icon-precomposed.png" />
     <link rel="icon" type="image/png" sizes="64x64" href="/favicon.png" />
     <link rel="icon" type="image/png" sizes="192x192" href="/pwa-192.png" />
   </head>
-  <body class="bg-slate-950 text-slate-100 h-full antialiased selection:bg-amber-500 selection:text-slate-950 overflow-x-hidden">
+  <body class="bg-warm h-full antialiased overflow-x-hidden">
     <div id="root" class="h-full flex flex-col"></div>
     <script type="module" src="/src/main.tsx"></script>
     <script>
       if ('serviceWorker' in navigator) {
         window.addEventListener('load', () => {
           navigator.serviceWorker.register('/sw.js').catch(err => {
-            console.warn('Registrazione ServiceWorker fallita:', err);
+            console.warn('SW registration failed:', err);
           });
         });
       }

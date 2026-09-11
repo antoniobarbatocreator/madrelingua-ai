@@ -1,126 +1,93 @@
-import React, { useState, useEffect } from 'react';
-import { ActiveTab, ChatMessage, KnowledgeDocument, TopicFocus, UserLevel, VoiceSettings } from './types';
-import { INITIAL_KNOWLEDGE_DOCUMENTS } from './data/defaultKnowledge';
-import { Navbar } from './components/Navbar';
-import { VoiceStudio } from './components/VoiceStudio';
-import { KnowledgeManager } from './components/KnowledgeManager';
-import { NeuroMethodGuide } from './components/NeuroMethodGuide';
-import { VocabularyHistory } from './components/VocabularyHistory';
-import { ConversationHistory } from './components/ConversationHistory';
-import { loadSettingsFromStorage, saveSettingsToStorage } from './lib/settingsStorage';
-import { loadKnowledgeDocsFromStorage, saveKnowledgeDocsToStorage } from './lib/knowledgeStorage';
+import React, { useState, useCallback } from "react";
+import { Tab, Activity, ChatMessage, AppSettings, SavedSession } from "./types";
+import { loadSessions, saveSession, deleteSession, loadSettings, saveSettings } from "./lib/storage";
+import { HomeScreen } from "./components/HomeScreen";
+import { SessionScreen } from "./components/SessionScreen";
+import { HistoryScreen } from "./components/HistoryScreen";
+import { SettingsScreen } from "./components/SettingsScreen";
+import { AboutScreen } from "./components/AboutScreen";
+import { TabBar } from "./components/TabBar";
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<ActiveTab>('studio');
+  const [activeTab, setActiveTab] = useState<Tab>("home");
+  const [inSession, setInSession] = useState(false);
+  const [settings, setSettings] = useState<AppSettings>(() => loadSettings());
+  const [savedSessions, setSavedSessions] = useState<SavedSession[]>(() => loadSessions());
+  const [currentActivity, setCurrentActivity] = useState<Activity>("conversazione");
 
-  // Synchronous Lazy State Initialization for App Settings
-  const [initialSettings] = useState(() => loadSettingsFromStorage());
-  const [voiceSettings, setVoiceSettings] = useState<VoiceSettings>(initialSettings.voiceSettings);
-  const [userLevel, setUserLevel] = useState<UserLevel>(initialSettings.userLevel);
-
-  const [topicFocus, setTopicFocus] = useState<TopicFocus>('FREE_TALK');
-  const [knowledgeDocs, setKnowledgeDocs] = useState<KnowledgeDocument[]>(() => loadKnowledgeDocsFromStorage());
-  const [resumedTitle, setResumedTitle] = useState<string | null>(null);
-
-  // Authoritative Save Function for Settings
-  const handleSaveAppSettings = (
-    nextVoiceSettings: VoiceSettings,
-    nextUserLevel: UserLevel
-  ): boolean => {
-    const saved = saveSettingsToStorage(nextVoiceSettings, nextUserLevel);
-    if (!saved) {
-      return false;
-    }
-    setVoiceSettings(nextVoiceSettings);
-    setUserLevel(nextUserLevel);
-    return true;
-  };
-
-  // Save knowledgeDocs to persistent storage whenever they change
-  useEffect(() => {
-    saveKnowledgeDocsToStorage(knowledgeDocs);
-  }, [knowledgeDocs]);
-
-  // Ensure document item counts are strictly synchronized with extractedChunks.length
-  useEffect(() => {
-    setKnowledgeDocs((prevDocs) =>
-      prevDocs.map((doc) => {
-        const count = doc.extractedChunks ? doc.extractedChunks.length : 0;
-        if (doc.vocabularyCount !== count || doc.indexedItemCount !== count) {
-          return {
-            ...doc,
-            vocabularyCount: count,
-            indexedItemCount: count,
-            indexingStatus: doc.indexingStatus || 'ready',
-          };
-        }
-        return doc;
-      })
-    );
+  const handleSelectActivity = useCallback((activity: Activity) => {
+    setCurrentActivity(activity);
+    setInSession(true);
   }, []);
 
-  // The active Gemini session owns the greeting. UI state starts empty to avoid duplicate welcomes.
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const handleSaveSession = useCallback((messages: ChatMessage[], activity: Activity) => {
+    const firstCoachMsg = messages.find((m) => m.sender === "coach");
+    const title = firstCoachMsg
+      ? firstCoachMsg.text.slice(0, 60) + (firstCoachMsg.text.length > 60 ? "..." : "")
+      : "Sessione";
 
-  const handleResumeConversation = (contextMessages: ChatMessage[], sourceTitle: string) => {
-    setMessages(contextMessages);
-    setResumedTitle(sourceTitle);
-    setActiveTab('studio');
-  };
+    const session: SavedSession = {
+      id: `s_${Date.now()}`,
+      title,
+      activity,
+      messages,
+      date: new Date().toLocaleDateString("it-IT"),
+      level: settings.level,
+    };
+
+    saveSession(session);
+    setSavedSessions(loadSessions());
+    setInSession(false);
+  }, [settings.level]);
+
+  const handleDeleteSession = useCallback((id: string) => {
+    deleteSession(id);
+    setSavedSessions(loadSessions());
+  }, []);
+
+  const handleSaveSettings = useCallback((newSettings: AppSettings) => {
+    setSettings(newSettings);
+    saveSettings(newSettings);
+  }, []);
+
+  if (inSession) {
+    return (
+      <SessionScreen
+        activity={currentActivity}
+        level={settings.level}
+        voiceName={settings.voiceName}
+        voiceMode={settings.voiceMode}
+        onBack={() => setInSession(false)}
+        onSave={handleSaveSession}
+      />
+    );
+  }
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-amber-500 selection:text-slate-950">
-      
-      {/* Top Navbar */}
-      <Navbar
+    <div className="h-app flex flex-col bg-warm">
+      <div className="flex-1 overflow-y-auto min-h-0">
+        {activeTab === "home" && (
+          <HomeScreen onSelectActivity={handleSelectActivity} />
+        )}
+        {activeTab === "history" && (
+          <HistoryScreen
+            sessions={savedSessions}
+            onDeleteSession={handleDeleteSession}
+          />
+        )}
+        {activeTab === "settings" && (
+          <SettingsScreen
+            settings={settings}
+            onSave={handleSaveSettings}
+          />
+        )}
+        {activeTab === "about" && <AboutScreen />}
+      </div>
+      <TabBar
         activeTab={activeTab}
-        setActiveTab={setActiveTab}
-        userLevel={userLevel}
-        knowledgeCount={knowledgeDocs.length}
-        voiceSettings={voiceSettings}
-        onSaveAppSettings={handleSaveAppSettings}
+        onChangeTab={setActiveTab}
+        historyCount={savedSessions.length}
       />
-
-      {/* Main Tab View Routing */}
-      <main className="flex-1 overflow-x-hidden pb-16 md:pb-0">
-        {activeTab === 'studio' && (
-          <VoiceStudio
-            userLevel={userLevel}
-            voiceSettings={voiceSettings}
-            setVoiceSettings={setVoiceSettings}
-            knowledgeDocs={knowledgeDocs}
-            messages={messages}
-            setMessages={setMessages}
-            resumedTitle={resumedTitle}
-            onSessionReset={() => setResumedTitle(null)}
-          />
-        )}
-
-        {activeTab === 'knowledge' && (
-          <KnowledgeManager
-            knowledgeDocs={knowledgeDocs}
-            setKnowledgeDocs={setKnowledgeDocs}
-          />
-        )}
-
-        {activeTab === 'method' && <NeuroMethodGuide />}
-
-        {activeTab === 'review' && (
-          <VocabularyHistory
-            messages={messages}
-            knowledgeDocs={knowledgeDocs}
-            voiceSettings={voiceSettings}
-            onGoToStudio={() => setActiveTab('studio')}
-          />
-        )}
-
-        {activeTab === 'history' && (
-          <ConversationHistory
-            onResumeConversation={handleResumeConversation}
-            onGoToStudio={() => setActiveTab('studio')}
-          />
-        )}
-      </main>
     </div>
   );
 }

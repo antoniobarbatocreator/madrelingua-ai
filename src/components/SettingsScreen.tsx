@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { AppSettings, LEVELS, VoiceMode } from "../types";
-import { Check, Volume2, Mic, Hand, ShieldCheck } from "lucide-react";
+import { Check, Volume2, Mic, Hand, Gauge } from "lucide-react";
 
 interface SettingsScreenProps {
   settings: AppSettings;
@@ -15,11 +15,19 @@ const VOICES = [
   { name: "Charon", label: "Charon", gender: "Maschile" },
 ];
 
+function paceLabel(rate: number): string {
+  if (rate <= 0.65) return "Molto lenta";
+  if (rate <= 0.75) return "Lenta";
+  if (rate <= 0.85) return "Moderata";
+  if (rate < 1) return "Quasi naturale";
+  return "Naturale";
+}
+
 export const SettingsScreen: React.FC<SettingsScreenProps> = ({ settings, onSave }) => {
   const [level, setLevel] = useState(settings.level);
   const [voiceName, setVoiceName] = useState(settings.voiceName);
   const [voiceMode, setVoiceMode] = useState<VoiceMode>(settings.voiceMode);
-  const [noiseRobust, setNoiseRobust] = useState(settings.noiseRobust);
+  const [speechRate, setSpeechRate] = useState(settings.speechRate);
   const [dirty, setDirty] = useState(false);
 
   const update = <T,>(setter: React.Dispatch<React.SetStateAction<T>>) => (val: T) => {
@@ -28,7 +36,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ settings, onSave
   };
 
   const handleSave = () => {
-    onSave({ level, voiceName, voiceMode, noiseRobust });
+    onSave({ level, voiceName, voiceMode, speechRate });
     setDirty(false);
   };
 
@@ -148,30 +156,42 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ settings, onSave
           </div>
         </section>
 
-        {/* Noise robustness */}
+        {/* Speaking pace */}
         <section className="bg-card rounded-2xl border border-warm p-5">
-          <div className="flex items-start justify-between gap-3">
-            <div className="flex gap-3">
-              <div className="w-9 h-9 rounded-lg bg-sky-700/10 flex items-center justify-center shrink-0">
-                <ShieldCheck className="w-4 h-4 text-sky-700" />
-              </div>
-              <div>
-                <h3 className="font-semibold text-sm text-primary">Ambiente rumoroso</h3>
-                <p className="text-[11px] text-muted mt-0.5 leading-snug">
-                  Filtra i rumori di fondo per funzionare al meglio anche in vivavoce o in ambienti rumorosi.
-                </p>
-              </div>
+          <div className="flex gap-3">
+            <div className="w-9 h-9 rounded-lg bg-sky-700/10 flex items-center justify-center shrink-0">
+              <Gauge className="w-4 h-4 text-sky-700" />
             </div>
-            <button
-              onClick={() => update(setNoiseRobust)(!noiseRobust)}
-              className={`w-12 h-7 rounded-full transition-colors cursor-pointer shrink-0 mt-0.5 ${
-                noiseRobust ? "bg-[#C2630B]" : "bg-[#C8BDB2]"
-              }`}
-            >
-              <div className={`w-5 h-5 rounded-full bg-white shadow-sm transition-transform mx-1 ${
-                noiseRobust ? "translate-x-5" : "translate-x-0"
-              }`} />
-            </button>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-baseline justify-between gap-2">
+                <h3 className="font-semibold text-sm text-primary">Velocita della voce</h3>
+                <span className="text-xs font-bold text-[#C2630B] tabular-nums shrink-0">
+                  {paceLabel(speechRate)}
+                </span>
+              </div>
+              <p className="text-[11px] text-muted mt-0.5 leading-snug">
+                Rallenta il coach mantenendo il tono naturale della voce, senza renderla piu grave.
+              </p>
+
+              <input
+                type="range"
+                min={0.6}
+                max={1}
+                step={0.05}
+                value={speechRate}
+                onChange={(e) => update(setSpeechRate)(Number(e.target.value))}
+                className="w-full mt-4 accent-[#C2630B] cursor-pointer"
+              />
+              <div className="flex justify-between text-[10px] text-[#C8BDB2] font-medium mt-1">
+                <span>Molto lenta</span>
+                <span>Naturale</span>
+              </div>
+
+              <p className="text-[11px] text-muted mt-3 leading-snug">
+                Se stai iniziando, tieni una velocita ridotta: capire ogni parola conta piu che
+                sentire un ritmo realistico. Alzala man mano che ti senti a tuo agio.
+              </p>
+            </div>
           </div>
         </section>
       </div>

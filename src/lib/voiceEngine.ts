@@ -1,3 +1,5 @@
+import { TimeStretcher } from "./timeStretch";
+
 export type Activity = "conversazione" | "lezione" | "vocabolario" | "quiz" | "traduci";
 export type VoiceMode = "free" | "push_to_talk";
 export type EngineState = "idle" | "connecting" | "listening" | "speaking" | "thinking";
@@ -60,6 +62,7 @@ export class VoiceEngine {
   private audioChunksSent = 0;
   private micLevel = 0;
   private isReconnecting = false;
+  private stretcher = new TimeStretcher();
   private wakeLock: WakeLockSentinel | null = null;
   private visibilityHandler: (() => void) | null = null;
 
@@ -90,8 +93,10 @@ export class VoiceEngine {
     level: string;
     voiceName: string;
     voiceMode: VoiceMode;
+    speechRate?: number;
   }) {
     this.voiceMode = config.voiceMode;
+    if (config.speechRate) this.stretcher.setSpeed(config.speechRate);
     this.setState("connecting");
 
     try {
@@ -203,6 +208,11 @@ export class VoiceEngine {
     this.wsSend({ type: "change_level", level });
   }
 
+  /** 1 = natural pace, 0.8 = 20% slower. Pitch is preserved either way. */
+  setSpeechRate(rate: number) {
+    this.stretcher.setSpeed(rate);
+  }
+
   setVoiceMode(mode: VoiceMode) {
     this.voiceMode = mode;
     if (mode === "push_to_talk") {
@@ -240,6 +250,7 @@ export class VoiceEngine {
         this.teacherPlaybackActive = true;
         this.currentTeacherTurnId = msg.teacherTurnId;
         this.coachTextAccumulator = "";
+        this.stretcher.reset();
         this.setState("speaking");
         break;
 
@@ -262,6 +273,7 @@ export class VoiceEngine {
       case "turn_complete":
         this.teacherPlaybackActive = false;
         this.currentTeacherTurnId = undefined;
+        this.flushStretcher();
         if (this.coachTextAccumulator.trim()) {
           this.options.onCoachTranscript(this.coachTextAccumulator.trim(), true);
         }
@@ -485,32 +497,51 @@ export class VoiceEngine {
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 
       const pcm16 = new Int16Array(bytes.buffer);
-      const float32 = new Float32Array(pcm16.length);
-      for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 32768.0;
+      const raw = new Float32Array(pcm16.length);
+      for (let i = 0; i < pcm16.length; i++) raw[i] = pcm16[i] / 32768.0;
 
-      const audioBuffer = this.outputCtx.createBuffer(1, float32.length, 24000);
-      audioBuffer.getChannelData(0).set(float32);
-
-      const source = this.outputCtx.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(this.outputCtx.destination);
-
-      const now = this.outputCtx.currentTime;
-      if (this.nextPlayTime < now) this.nextPlayTime = now;
-
-      source.start(this.nextPlayTime);
-      this.nextPlayTime += audioBuffer.duration;
-      this.activeSourceNodes.push(source);
-
-      source.onended = () => {
-        this.activeSourceNodes = this.activeSourceNodes.filter((s) => s !== source);
-      };
+      // Slow the coach down without dropping its pitch. At speed 1 this is a
+      // pass-through; below 1 the stretched buffer is genuinely longer, so the
+      // scheduling stays correct with no extra arithmetic.
+      this.scheduleSamples(this.stretcher.process(raw));
     } catch (err) {
       console.error("Audio playback error:", err);
     }
   }
 
+  /** Play out the stretcher tail so the last word of a turn is not clipped. */
+  private flushStretcher() {
+    try {
+      this.scheduleSamples(this.stretcher.flush());
+    } catch (err) {
+      console.error("Audio flush error:", err);
+    }
+  }
+
+  private scheduleSamples(samples: Float32Array) {
+    if (!this.outputCtx || samples.length === 0) return;
+
+    const audioBuffer = this.outputCtx.createBuffer(1, samples.length, 24000);
+    audioBuffer.getChannelData(0).set(samples);
+
+    const source = this.outputCtx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(this.outputCtx.destination);
+
+    const now = this.outputCtx.currentTime;
+    if (this.nextPlayTime < now) this.nextPlayTime = now;
+
+    source.start(this.nextPlayTime);
+    this.nextPlayTime += audioBuffer.duration;
+    this.activeSourceNodes.push(source);
+
+    source.onended = () => {
+      this.activeSourceNodes = this.activeSourceNodes.filter((s) => s !== source);
+    };
+  }
+
   private stopAudioPlayback() {
+    this.stretcher.reset();
     for (const source of this.activeSourceNodes) {
       try {
         source.stop();

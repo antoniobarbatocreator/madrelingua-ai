@@ -24,7 +24,8 @@ export interface AppSettings {
   level: string;
   voiceName: string;
   voiceMode: VoiceMode;
-  noiseRobust: boolean;
+  /** Coach speaking pace. 1 = natural, 0.7 = 30% slower. Pitch is preserved. */
+  speechRate: number;
 }
 
 export const LEVELS = ["A1-A2", "B1-B2", "C1-C2"] as const;

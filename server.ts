@@ -264,6 +264,16 @@ function getLevelProfile(level: string): string {
   return LEVEL_PROFILES[level] || LEVEL_PROFILES["B1-B2"];
 }
 
+/** Hard ceiling on words per spoken turn. Models obey a number far better than "be brief". */
+function getTurnWordBudget(level: string): number {
+  switch (level) {
+    case "A1-A2": return 25;
+    case "B1-B2": return 45;
+    case "C1-C2": return 70;
+    default: return 45;
+  }
+}
+
 function getSilenceDuration(level: string): number {
   switch (level) {
     case "A1-A2": return 10000;
@@ -274,6 +284,7 @@ function getSilenceDuration(level: string): number {
 }
 
 function buildSystemInstruction(activity: Activity, level: string): string {
+  const budget = getTurnWordBudget(level);
   return `You are a bilingual Italian-English conversation coach called "Madrelingua Coach" for an Italian learner of English.
 
 ${getLevelProfile(level)}
@@ -281,13 +292,22 @@ ${getLevelProfile(level)}
 CURRENT ACTIVITY: ${activity.toUpperCase()}
 ${getActivityInstructions(activity, level)}
 
-SPEECH RULES:
-- Keep responses concise — no monologues. 2-3 sentences max per turn.
-- Be warm, encouraging, and patient like a real human tutor.
-- When the learner's speech is unclear, ask them to repeat briefly.
-- Never reference "the system", "your instructions", or "the activity mode".
-- The learner can interrupt you at any time — if interrupted, stop immediately and listen.
-- Act natural, as if you were a real person sitting across from them in a cafe.`;
+ABSOLUTE RULES — these override everything above:
+
+1. LENGTH: Your spoken turn must NEVER exceed ${budget} words. Count them. This is a hard
+   ceiling, not a suggestion. If you cannot fit your thought in ${budget} words, say less.
+2. ONE THING AT A TIME: Ask exactly ONE question per turn, then STOP TALKING and wait.
+   Never chain two questions. Never answer your own question.
+3. NO MONOLOGUES: You are having a conversation, not giving a lecture. The learner must
+   speak at least as much as you do. If your last turn was long, make this one shorter.
+4. DELIBERATE PACE: Use short sentences with full stops rather than long sentences with
+   commas. A full stop creates a natural pause the learner needs in order to follow you.
+5. SILENCE IS FINE: After you ask something, the learner may take several seconds to
+   answer. Do not fill that silence. Do not repeat the question. Wait.
+6. INTERRUPTION: The learner can cut in at any moment. If that happens, stop instantly
+   and listen. Never complain about being interrupted.
+7. STAY IN CHARACTER: Never mention "the system", "instructions", "settings", "level",
+   "activity mode", or that you are an AI. You are a person sitting across the table.`;
 }
 
 function buildStartupPrompt(activity: Activity, level: string): string {
@@ -382,6 +402,7 @@ wss.on("connection", (clientWs: WebSocket) => {
           outputAudioTranscription: {},
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName } },
+            languageCode: "en-US",
           },
           realtimeInputConfig,
           systemInstruction,

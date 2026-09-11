@@ -3,6 +3,13 @@ import { SavedSession, AppSettings } from "../types";
 const SESSIONS_KEY = "madrelingua_sessions";
 const SETTINGS_KEY = "madrelingua_settings";
 
+const DEFAULTS: AppSettings = {
+  level: "A1-A2",
+  voiceName: "Achird",
+  voiceMode: "free",
+  speechRate: 0.85,
+};
+
 export function loadSessions(): SavedSession[] {
   try {
     const raw = localStorage.getItem(SESSIONS_KEY);
@@ -29,10 +36,10 @@ export function loadSettings(): AppSettings {
     const raw = localStorage.getItem(SETTINGS_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      return { level: "A1-A2", voiceName: "Achird", voiceMode: "free", noiseRobust: true, ...parsed };
+      return { ...DEFAULTS, ...parsed };
     }
   } catch {}
-  return { level: "A1-A2", voiceName: "Achird", voiceMode: "free", noiseRobust: true };
+  return { ...DEFAULTS };
 }
 
 export function saveSettings(settings: AppSettings) {

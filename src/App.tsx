@@ -57,6 +57,7 @@ export default function App() {
         level={settings.level}
         voiceName={settings.voiceName}
         voiceMode={settings.voiceMode}
+        speechRate={settings.speechRate}
         onBack={() => setInSession(false)}
         onSave={handleSaveSession}
       />

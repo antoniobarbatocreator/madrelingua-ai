@@ -23,6 +23,7 @@ interface SessionScreenProps {
   level: string;
   voiceName: string;
   voiceMode: VoiceMode;
+  speechRate: number;
   onBack: () => void;
   onSave: (messages: ChatMessage[], activity: Activity) => void;
 }
@@ -32,6 +33,7 @@ export const SessionScreen: React.FC<SessionScreenProps> = ({
   level,
   voiceName,
   voiceMode,
+  speechRate,
   onBack,
   onSave,
 }) => {
@@ -90,12 +92,12 @@ export const SessionScreen: React.FC<SessionScreenProps> = ({
     });
 
     engineRef.current = engine;
-    engine.connect({ activity, level, voiceName, voiceMode });
+    engine.connect({ activity, level, voiceName, voiceMode, speechRate });
 
     return () => {
       engine.disconnect();
     };
-  }, [activity, level, voiceName, voiceMode, scrollToBottom]);
+  }, [activity, level, voiceName, voiceMode, speechRate, scrollToBottom]);
 
   const handleDisconnect = () => {
     engineRef.current?.disconnect();

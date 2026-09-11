@@ -1,8 +1,15 @@
 import { TimeStretcher } from "./timeStretch";
 
-export type Activity = "conversazione" | "lezione" | "vocabolario" | "quiz" | "traduci";
+export type Activity = "conversazione" | "lezione" | "vocabolario" | "quiz" | "traduci" | "ripasso";
 export type VoiceMode = "free" | "push_to_talk";
 export type EngineState = "idle" | "connecting" | "listening" | "speaking" | "thinking";
+
+/** A batch of the learner's own vocabulary, chosen by the app, not by the model. */
+export interface SessionKnowledge {
+  items: { phrase: string; translation: string; context?: string; category?: string }[];
+  sourceName?: string;
+  mode: "drill" | "conversation";
+}
 
 export interface VoiceEngineOptions {
   onStateChange: (state: EngineState) => void;
@@ -94,6 +101,7 @@ export class VoiceEngine {
     voiceName: string;
     voiceMode: VoiceMode;
     speechRate?: number;
+    knowledge?: SessionKnowledge;
   }) {
     this.voiceMode = config.voiceMode;
     if (config.speechRate) this.stretcher.setSpeed(config.speechRate);
@@ -125,6 +133,7 @@ export class VoiceEngine {
         level: config.level,
         voiceName: config.voiceName,
         turnMode: config.voiceMode === "push_to_talk" ? "push_to_talk" : "free",
+        knowledge: config.knowledge,
       }));
     };
 

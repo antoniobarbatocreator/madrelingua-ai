@@ -8,6 +8,7 @@ import {
   Target,
   ArrowLeftRight,
   ChevronRight,
+  Library,
 } from "lucide-react";
 
 interface HomeScreenProps {
@@ -20,6 +21,8 @@ const ACTIVITY_ICONS: Record<Activity, React.FC<{ className?: string }>> = {
   vocabolario: Languages,
   quiz: Target,
   traduci: ArrowLeftRight,
+  // Started from the Libreria tab, where the batch and mode are chosen
+  ripasso: Library,
 };
 
 const ACTIVITY_COLORS: Record<Activity, { bg: string; icon: string; hover: string }> = {
@@ -28,6 +31,7 @@ const ACTIVITY_COLORS: Record<Activity, { bg: string; icon: string; hover: strin
   vocabolario: { bg: "bg-emerald-700/10", icon: "text-emerald-700", hover: "hover:border-emerald-600/30" },
   quiz: { bg: "bg-violet-700/10", icon: "text-violet-700", hover: "hover:border-violet-600/30" },
   traduci: { bg: "bg-rose-700/10", icon: "text-rose-700", hover: "hover:border-rose-600/30" },
+  ripasso: { bg: "bg-[#FFF3E6]", icon: "text-[#C2630B]", hover: "hover:border-[#C2630B]/30" },
 };
 
 const activities: Activity[] = ["conversazione", "lezione", "vocabolario", "quiz", "traduci"];

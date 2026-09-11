@@ -2,7 +2,7 @@ import { Activity, VoiceMode, EngineState } from "./lib/voiceEngine";
 
 export type { Activity, VoiceMode, EngineState };
 
-export type Tab = "home" | "history" | "settings" | "about";
+export type Tab = "home" | "knowledge" | "history" | "settings" | "about";
 
 export interface ChatMessage {
   id: string;
@@ -36,4 +36,5 @@ export const ACTIVITY_META: Record<Activity, { label: string; description: strin
   vocabolario: { label: "Vocabolario", description: "Impara parole nuove e phrasal verbs" },
   quiz: { label: "Quiz", description: "Giochi e tecniche per imparare divertendoti" },
   traduci: { label: "Traduci", description: "Traduci frasi e scopri come si dice in inglese" },
+  ripasso: { label: "Ripasso", description: "I vocaboli della tua libreria personale" },
 };

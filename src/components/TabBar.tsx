@@ -1,6 +1,6 @@
 import React from "react";
 import { Tab } from "../types";
-import { Home, Clock, Settings, Info } from "lucide-react";
+import { Home, BookOpen, Clock, Settings, Info } from "lucide-react";
 
 interface TabBarProps {
   activeTab: Tab;
@@ -10,6 +10,7 @@ interface TabBarProps {
 
 const TABS: { id: Tab; label: string; Icon: React.FC<{ className?: string }> }[] = [
   { id: "home", label: "Home", Icon: Home },
+  { id: "knowledge", label: "Libreria", Icon: BookOpen },
   { id: "history", label: "Cronologia", Icon: Clock },
   { id: "settings", label: "Impostazioni", Icon: Settings },
   { id: "about", label: "Info", Icon: Info },

@@ -6,7 +6,10 @@ import { SessionScreen } from "./components/SessionScreen";
 import { HistoryScreen } from "./components/HistoryScreen";
 import { SettingsScreen } from "./components/SettingsScreen";
 import { AboutScreen } from "./components/AboutScreen";
+import { KnowledgeScreen, ReviewMode } from "./components/KnowledgeScreen";
 import { TabBar } from "./components/TabBar";
+import { KnowledgeItem } from "./lib/knowledge";
+import { SessionKnowledge } from "./lib/voiceEngine";
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>("home");
@@ -14,11 +17,31 @@ export default function App() {
   const [settings, setSettings] = useState<AppSettings>(() => loadSettings());
   const [savedSessions, setSavedSessions] = useState<SavedSession[]>(() => loadSessions());
   const [currentActivity, setCurrentActivity] = useState<Activity>("conversazione");
+  const [knowledge, setKnowledge] = useState<SessionKnowledge | undefined>();
 
   const handleSelectActivity = useCallback((activity: Activity) => {
     setCurrentActivity(activity);
+    setKnowledge(undefined);
     setInSession(true);
   }, []);
+
+  const handleStartReview = useCallback(
+    (items: KnowledgeItem[], mode: ReviewMode, sourceName?: string) => {
+      setKnowledge({
+        items: items.map((i) => ({
+          phrase: i.phrase,
+          translation: i.translation,
+          context: i.context,
+          category: i.category,
+        })),
+        sourceName,
+        mode,
+      });
+      setCurrentActivity("ripasso");
+      setInSession(true);
+    },
+    []
+  );
 
   const handleSaveSession = useCallback((messages: ChatMessage[], activity: Activity) => {
     const firstCoachMsg = messages.find((m) => m.sender === "coach");
@@ -58,6 +81,7 @@ export default function App() {
         voiceName={settings.voiceName}
         voiceMode={settings.voiceMode}
         speechRate={settings.speechRate}
+        knowledge={knowledge}
         onBack={() => setInSession(false)}
         onSave={handleSaveSession}
       />
@@ -69,6 +93,9 @@ export default function App() {
       <div className="flex-1 overflow-y-auto min-h-0">
         {activeTab === "home" && (
           <HomeScreen onSelectActivity={handleSelectActivity} />
+        )}
+        {activeTab === "knowledge" && (
+          <KnowledgeScreen onStartReview={handleStartReview} />
         )}
         {activeTab === "history" && (
           <HistoryScreen

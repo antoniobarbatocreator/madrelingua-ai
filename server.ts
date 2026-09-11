@@ -2,6 +2,8 @@ import "dotenv/config";
 import express from "express";
 import path from "path";
 import http from "http";
+import multer from "multer";
+import * as pdfParseModule from "pdf-parse";
 import { WebSocketServer, WebSocket } from "ws";
 import {
   GoogleGenAI,
@@ -10,13 +12,21 @@ import {
   EndSensitivity,
   ActivityHandling,
   LiveServerMessage,
+  Type,
 } from "@google/genai";
 import { createServer as createViteServer } from "vite";
+
+const pdfParse: any = (pdfParseModule as any).default || pdfParseModule;
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json({ limit: "5mb" }));
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 },
+});
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 if (!GEMINI_API_KEY) {
@@ -56,11 +66,281 @@ app.post("/api/voice-preview", async (req, res) => {
   }
 });
 
+// ── Knowledge extraction ────────────────────────────────────────
+
+interface ExtractedItem {
+  phrase: string;
+  translation: string;
+  context?: string;
+  category?: string;
+}
+
+/** Split on sentence boundaries where possible so an entry is not cut in half. */
+function splitIntoBlocks(text: string, size: number): string[] {
+  const blocks: string[] = [];
+  let at = 0;
+  while (at < text.length) {
+    let end = Math.min(at + size, text.length);
+    if (end < text.length) {
+      const breakAt = text.lastIndexOf(". ", end);
+      if (breakAt > at + size * 0.5) end = breakAt + 1;
+    }
+    blocks.push(text.slice(at, end));
+    at = end;
+  }
+  return blocks;
+}
+
+function dedupeItems(items: ExtractedItem[]): ExtractedItem[] {
+  const seen = new Set<string>();
+  const out: ExtractedItem[] = [];
+  for (const item of items) {
+    const phrase = (item.phrase || "").trim();
+    if (!phrase) continue;
+    const key = phrase.toLowerCase().replace(/[^a-z0-9\s']/g, "").replace(/\s+/g, " ").trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      phrase,
+      translation: (item.translation || "").trim(),
+      context: (item.context || "").trim(),
+      category: (item.category || "Generale").trim(),
+    });
+  }
+  return out;
+}
+
+const MAX_BLOCKS = 12;
+const BLOCK_SIZE = 9000;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Retry the transient failures the Gemini API hands out under load. */
+async function callWithRetry<T>(fn: () => Promise<T>, tries = 4): Promise<T> {
+  let lastErr: any;
+  for (let attempt = 0; attempt < tries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastErr = err;
+      const status = err?.status;
+      if (status !== 503 && status !== 429 && status !== 500) throw err;
+      console.warn(`[KNOWLEDGE] API ${status}, retry ${attempt + 1}/${tries}`);
+      await sleep(1500 * (attempt + 1));
+    }
+  }
+  throw lastErr;
+}
+
+async function extractVocabulary(rawText: string): Promise<ExtractedItem[]> {
+  // Keep line structure: in study notes one line is usually one entry
+  const text = rawText
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (!text) return [];
+
+  const ai = getGeminiClient();
+  const blocks = splitIntoBlocks(text, BLOCK_SIZE).slice(0, MAX_BLOCKS);
+  console.log(`[KNOWLEDGE] Extracting from ${blocks.length} block(s), ${text.length} chars`);
+
+  const collected: ExtractedItem[] = [];
+
+  for (let i = 0; i < blocks.length; i++) {
+    const prompt = `These are study notes belonging to an Italian learner of English. They come from lessons with native speakers, so they may be messy: bullet points, half sentences, mixed Italian and English.
+
+Extract EVERY English item worth revising: vocabulary, phrasal verbs, idioms, collocations, fixed expressions and useful grammar structures.
+
+For each item give:
+- phrase: the English item in its base form (infinitive for verbs, singular for nouns)
+- translation: the Italian translation, accurate for how it is used here
+- context: a short natural English sentence showing the item in use. If the notes already contain a good example, prefer it.
+- category: a short theme label in Italian (Lavoro, Viaggi, Vita quotidiana, Cibo, Salute, Grammatica, Modi di dire, ...)
+
+Rules:
+- If the notes already pair an English item with its Italian translation, keep that pairing exactly.
+- Do not invent items that are not in the notes.
+- Do not include bare proper nouns, page numbers or headings.
+- Extract generously: missing something the learner wrote down is worse than including something ordinary.
+
+Notes (block ${i + 1} of ${blocks.length}):
+${blocks[i]}`;
+
+    // The model occasionally returns a near-empty array for a block that plainly
+    // holds dozens of entries. It is not deterministic, so the guard is to notice
+    // an implausibly thin result and ask again, keeping the richest answer.
+    const minPlausible = Math.max(3, Math.floor(blocks[i].length / 400));
+    let best: ExtractedItem[] = [];
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const res = await callWithRetry(() =>
+          ai.models.generateContent({
+            model: "gemini-3.6-flash",
+            contents: prompt,
+            config: {
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    phrase: { type: Type.STRING },
+                    translation: { type: Type.STRING },
+                    context: { type: Type.STRING },
+                    category: { type: Type.STRING },
+                  },
+                  required: ["phrase", "translation"],
+                },
+              },
+            },
+          })
+        );
+
+        const parsed = res.text ? JSON.parse(res.text) : [];
+        const got: ExtractedItem[] = Array.isArray(parsed) ? parsed : [];
+        if (got.length > best.length) best = got;
+
+        if (best.length >= minPlausible) break;
+        console.warn(
+          `[KNOWLEDGE] Block ${i + 1}: only ${got.length} items for ${blocks[i].length} chars ` +
+            `(expected >= ${minPlausible}), retrying`
+        );
+      } catch (err: any) {
+        console.warn(`[KNOWLEDGE] Block ${i + 1} attempt ${attempt + 1} failed:`, err?.message || err);
+      }
+    }
+
+    collected.push(...best);
+  }
+
+  const deduped = dedupeItems(collected);
+  console.log(`[KNOWLEDGE] Extracted ${deduped.length} unique items (${collected.length} raw)`);
+  return deduped;
+}
+
+app.post("/api/knowledge/extract-text", async (req, res) => {
+  try {
+    const text = String(req.body?.text || "");
+    if (text.trim().length < 10) {
+      return res.status(400).json({ error: "Testo troppo corto." });
+    }
+    const items = await extractVocabulary(text);
+    return res.json({ success: true, items, excerpt: text.slice(0, 8000) });
+  } catch (error: any) {
+    console.error("[KNOWLEDGE] extract-text failed:", error?.message);
+    return res.status(500).json({ error: error.message || "Estrazione fallita." });
+  }
+});
+
+app.post("/api/knowledge/extract-pdf", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "Nessun file ricevuto." });
+    console.log(`[KNOWLEDGE] PDF: ${req.file.originalname} (${req.file.size} bytes)`);
+
+    let text = "";
+    try {
+      const parsed = await pdfParse(req.file.buffer);
+      text = parsed.text || "";
+    } catch (parseErr) {
+      console.warn("[KNOWLEDGE] pdf-parse failed, falling back to raw text");
+      text = req.file.buffer.toString("utf-8");
+    }
+
+    text = text.replace(/\s+/g, " ").trim();
+    if (text.length < 10) {
+      return res.status(400).json({
+        error: "Nessun testo leggibile nel file. Se e una scansione, il testo non e selezionabile.",
+      });
+    }
+
+    const items = await extractVocabulary(text);
+    return res.json({ success: true, items, excerpt: text.slice(0, 8000) });
+  } catch (error: any) {
+    console.error("[KNOWLEDGE] extract-pdf failed:", error?.message);
+    return res.status(500).json({ error: error.message || "Lettura del file fallita." });
+  }
+});
+
 // ── Activity definitions ────────────────────────────────────────
-type Activity = "conversazione" | "lezione" | "vocabolario" | "quiz" | "traduci";
+type Activity = "conversazione" | "lezione" | "vocabolario" | "quiz" | "traduci" | "ripasso";
+
+interface SessionKnowledge {
+  items: { phrase: string; translation: string; context?: string; category?: string }[];
+  sourceName?: string;
+  mode: "drill" | "conversation";
+}
+
+/**
+ * The batch is chosen by the app, never by the model. The model gets only these
+ * items and is told not to stray, which is what stops a review from drifting
+ * back to the same familiar handful of words session after session.
+ */
+function buildKnowledgeBlock(k: SessionKnowledge, level: string): string {
+  const list = k.items
+    .map((it, n) => {
+      const example = it.context ? ` | example: ${it.context}` : "";
+      return `${n + 1}. ${it.phrase} = ${it.translation}${example}`;
+    })
+    .join("\n");
+
+  const scope = k.sourceName
+    ? `These come from the learner's own notes titled "${k.sourceName}".`
+    : `These come from the learner's own study notes.`;
+
+  if (k.mode === "conversation") {
+    return `
+THE LEARNER'S OWN MATERIAL — today's selection:
+${list}
+
+${scope}
+
+HOW TO USE IT:
+- Hold a natural conversation, but steer it so these specific items come up.
+- Work them in one at a time, in context, the way they would really be used.
+- Do NOT announce the list and do NOT quiz mechanically. This is a conversation.
+- When the learner uses one of these correctly, acknowledge it briefly and move on.
+- If they never reach one, use it yourself in your own reply so they hear it in context.
+- Cover as many of the ${k.items.length} items as the conversation naturally allows.
+- Do NOT bring in vocabulary outside this list unless the learner introduces it.`;
+  }
+
+  return `
+THE LEARNER'S OWN MATERIAL — today's selection:
+${list}
+
+${scope}
+
+HOW TO DRILL IT:
+- Work through these ${k.items.length} items ONE AT A TIME, in the order given.
+- For each one, pick a different way to test it so the session does not feel mechanical:
+  say the Italian and ask for the English; give an English sentence with the item
+  missing; describe a situation and ask which expression fits; ask them to build
+  their own sentence with it.
+- Wait for the answer. Give the learner time to think.
+- If correct: confirm briefly, then move straight to the next item.
+- If wrong or unsure: give the correct form, say it clearly once more, and have them
+  repeat it before moving on.
+- Announce progress occasionally ("ne restano quattro") so the session feels finite.
+- STAY INSIDE THIS LIST. These are the words the app selected for today. Do not
+  substitute other vocabulary, and do not revisit an item once it is done.
+- When all ${k.items.length} are covered, give a short recap of the ones that needed
+  correcting, then tell the learner the review is complete.`;
+}
 
 function getActivityInstructions(activity: Activity, level: string): string {
   const l = level || "B1-B2";
+
+  if (activity === "ripasso") {
+    return `PERSONAL REVIEW MODE:
+- You are reviewing material the learner collected themselves, from their own English course.
+- The exact items for this session are listed further down. They were chosen by the app
+  based on what the learner has already practised and what they are due to revisit.
+- Treat this material as the point of the session. It matters more to them than anything
+  you could think up, because it is what they actually wrote down in their lessons.
+- Adapt HOW you explain to level ${l}, but never swap the items for easier or harder ones.`;
+  }
 
   if (activity === "conversazione") {
     if (l === "A1-A2") return `FREE CONVERSATION — A1-A2:
@@ -283,14 +563,23 @@ function getSilenceDuration(level: string): number {
   }
 }
 
-function buildSystemInstruction(activity: Activity, level: string): string {
+function buildSystemInstruction(
+  activity: Activity,
+  level: string,
+  knowledge?: SessionKnowledge
+): string {
   const budget = getTurnWordBudget(level);
+  const knowledgeBlock = knowledge && knowledge.items.length > 0
+    ? buildKnowledgeBlock(knowledge, level)
+    : "";
+
   return `You are a bilingual Italian-English conversation coach called "Madrelingua Coach" for an Italian learner of English.
 
 ${getLevelProfile(level)}
 
 CURRENT ACTIVITY: ${activity.toUpperCase()}
 ${getActivityInstructions(activity, level)}
+${knowledgeBlock}
 
 ABSOLUTE RULES — these override everything above:
 
@@ -328,6 +617,8 @@ function buildStartupPrompt(activity: Activity, level: string): string {
       return `Saluta con entusiasmo e proponi il primo gioco. Spiega brevemente le regole e inizia subito con la prima domanda.${levelHint}`;
     case "traduci":
       return `Saluta brevemente e di' allo studente che puo dirti o scriverti qualsiasi frase e tu la tradurrai. Chiedi cosa vuole tradurre.${levelHint}`;
+    case "ripasso":
+      return `Saluta molto brevemente e parti subito con il PRIMO elemento della lista che ti e stata data. Non elencare le parole in anticipo, non spiegare come funziona il ripasso: fai direttamente la prima domanda.${levelHint}`;
   }
 }
 
@@ -354,6 +645,7 @@ interface SessionData {
   turnSequence: number;
   resumptionHandle?: string;
   audioChunksReceived?: number;
+  knowledge?: SessionKnowledge;
   reconnecting: boolean;
   reconnectAttempts: number;
   ended: boolean;
@@ -386,7 +678,7 @@ wss.on("connection", (clientWs: WebSocket) => {
           activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
         };
 
-    const systemInstruction = buildSystemInstruction(activity, level);
+    const systemInstruction = buildSystemInstruction(activity, level, sess.knowledge);
     const sessionResumption = isReconnect && sess.resumptionHandle
       ? { handle: sess.resumptionHandle }
       : undefined;
@@ -562,11 +854,28 @@ wss.on("connection", (clientWs: WebSocket) => {
 
         console.log(`[INIT] activity=${activity} level=${level} voice=${voiceName} mode=${turnMode}`);
 
+        const knowledge: SessionKnowledge | undefined =
+          msg.knowledge && Array.isArray(msg.knowledge.items) && msg.knowledge.items.length > 0
+            ? {
+                items: msg.knowledge.items.slice(0, 40),
+                sourceName: msg.knowledge.sourceName,
+                mode: msg.knowledge.mode === "conversation" ? "conversation" : "drill",
+              }
+            : undefined;
+
+        if (knowledge) {
+          console.log(
+            `[INIT] Knowledge batch: ${knowledge.items.length} items, mode=${knowledge.mode}` +
+              (knowledge.sourceName ? `, source="${knowledge.sourceName}"` : "")
+          );
+        }
+
         session = {
           activity,
           level,
           voiceName,
           turnMode,
+          knowledge,
           liveSessionReady: false,
           initialTurnSent: false,
           teacherTurnActive: false,

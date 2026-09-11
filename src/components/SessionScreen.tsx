@@ -6,7 +6,7 @@ import {
   ChatMessage,
   ACTIVITY_META,
 } from "../types";
-import { VoiceEngine } from "../lib/voiceEngine";
+import { VoiceEngine, SessionKnowledge } from "../lib/voiceEngine";
 import {
   ArrowLeft,
   Save,
@@ -24,6 +24,7 @@ interface SessionScreenProps {
   voiceName: string;
   voiceMode: VoiceMode;
   speechRate: number;
+  knowledge?: SessionKnowledge;
   onBack: () => void;
   onSave: (messages: ChatMessage[], activity: Activity) => void;
 }
@@ -34,6 +35,7 @@ export const SessionScreen: React.FC<SessionScreenProps> = ({
   voiceName,
   voiceMode,
   speechRate,
+  knowledge,
   onBack,
   onSave,
 }) => {
@@ -92,12 +94,12 @@ export const SessionScreen: React.FC<SessionScreenProps> = ({
     });
 
     engineRef.current = engine;
-    engine.connect({ activity, level, voiceName, voiceMode, speechRate });
+    engine.connect({ activity, level, voiceName, voiceMode, speechRate, knowledge });
 
     return () => {
       engine.disconnect();
     };
-  }, [activity, level, voiceName, voiceMode, speechRate, scrollToBottom]);
+  }, [activity, level, voiceName, voiceMode, speechRate, knowledge, scrollToBottom]);
 
   const handleDisconnect = () => {
     engineRef.current?.disconnect();

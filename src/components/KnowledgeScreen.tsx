@@ -323,6 +323,12 @@ export const KnowledgeScreen: React.FC<KnowledgeScreenProps> = ({ onStartReview 
               </p>
             </>
           )}
+
+          <p className="text-[11px] text-[#C8BDB2] mt-3 leading-snug border-t border-warm pt-3">
+            L&apos;analisi usa il piano gratuito di Google, che consente circa 20 elaborazioni al
+            giorno. Conviene caricare un documento corposo per volta invece di tanti piccoli: il
+            costo e per elaborazione, non per lunghezza.
+          </p>
         </section>
 
         {/* Sources */}

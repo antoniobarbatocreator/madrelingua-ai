@@ -110,19 +110,46 @@ function dedupeItems(items: ExtractedItem[]): ExtractedItem[] {
   return out;
 }
 
-const MAX_BLOCKS = 12;
-const BLOCK_SIZE = 9000;
+/**
+ * Block sizing is driven by quota, not by context limits. The free tier allows
+ * only 20 generate-content requests per day for this model, so every request
+ * counts: a document must cost one or two, not a dozen. The input window is far
+ * larger than this, so the real ceiling is how many items fit in one response,
+ * which is why maxOutputTokens is raised rather than the text being chopped up.
+ */
+const BLOCK_SIZE = 30000;
+const MAX_BLOCKS = 6;
+const BLOCK_CONCURRENCY = 3;
+const MAX_OUTPUT_TOKENS = 32000;
+
+/** Raised when the daily free-tier allowance is gone, so the UI can say so plainly. */
+class QuotaExceededError extends Error {
+  constructor() {
+    super("quota");
+  }
+}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Retry the transient failures the Gemini API hands out under load. */
-async function callWithRetry<T>(fn: () => Promise<T>, tries = 4): Promise<T> {
+/** A 429 for the daily allowance is permanent today; a per-minute one is not. */
+function isDailyQuota(err: any): boolean {
+  const msg = String(err?.message || "");
+  return err?.status === 429 && /PerDay|per day|RequestsPerDay/i.test(msg);
+}
+
+/**
+ * Retry the transient failures the API hands out under load, but give up at once
+ * when the daily allowance is gone: retrying that only burns time and never
+ * succeeds, and the caller needs to tell the user what actually happened.
+ */
+async function callWithRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
   let lastErr: any;
   for (let attempt = 0; attempt < tries; attempt++) {
     try {
       return await fn();
     } catch (err: any) {
       lastErr = err;
+      if (isDailyQuota(err)) throw new QuotaExceededError();
       const status = err?.status;
       if (status !== 503 && status !== 429 && status !== 500) throw err;
       console.warn(`[KNOWLEDGE] API ${status}, retry ${attempt + 1}/${tries}`);
@@ -143,12 +170,67 @@ async function extractVocabulary(rawText: string): Promise<ExtractedItem[]> {
 
   const ai = getGeminiClient();
   const blocks = splitIntoBlocks(text, BLOCK_SIZE).slice(0, MAX_BLOCKS);
+  const started = Date.now();
   console.log(`[KNOWLEDGE] Extracting from ${blocks.length} block(s), ${text.length} chars`);
 
+  // Blocks are independent, so run them in parallel. Sequentially a long PDF
+  // would take blocks x (call + retries), which runs into minutes. Bounded so a
+  // big document does not fire a dozen simultaneous calls at a loaded API.
   const collected: ExtractedItem[] = [];
+  let quotaHit = false;
 
-  for (let i = 0; i < blocks.length; i++) {
-    const prompt = `These are study notes belonging to an Italian learner of English. They come from lessons with native speakers, so they may be messy: bullet points, half sentences, mixed Italian and English.
+  for (let start = 0; start < blocks.length; start += BLOCK_CONCURRENCY) {
+    if (quotaHit) break;
+    const slice = blocks.slice(start, start + BLOCK_CONCURRENCY);
+    const results = await Promise.allSettled(
+      slice.map((block, n) => extractBlock(ai, block, start + n, blocks.length))
+    );
+    for (const r of results) {
+      if (r.status === "fulfilled") {
+        collected.push(...r.value);
+      } else if (r.reason instanceof QuotaExceededError) {
+        quotaHit = true;
+      } else {
+        console.warn("[KNOWLEDGE] Block failed:", r.reason?.message || r.reason);
+      }
+    }
+  }
+
+  // Running out of allowance with nothing to show must not be reported as "no
+  // vocabulary found": the learner would blame their own notes and try again,
+  // spending the allowance they no longer have.
+  if (quotaHit && collected.length === 0) throw new QuotaExceededError();
+  if (quotaHit) console.warn("[KNOWLEDGE] Daily quota hit; returning partial results");
+
+  const deduped = dedupeItems(collected);
+  console.log(
+    `[KNOWLEDGE] Extracted ${deduped.length} unique items (${collected.length} raw) ` +
+      `in ${((Date.now() - started) / 1000).toFixed(1)}s`
+  );
+  return deduped;
+}
+
+const EXTRACTION_SCHEMA = {
+  type: Type.ARRAY,
+  items: {
+    type: Type.OBJECT,
+    properties: {
+      phrase: { type: Type.STRING },
+      translation: { type: Type.STRING },
+      context: { type: Type.STRING },
+      category: { type: Type.STRING },
+    },
+    required: ["phrase", "translation"],
+  },
+};
+
+async function extractBlock(
+  ai: GoogleGenAI,
+  block: string,
+  index: number,
+  total: number
+): Promise<ExtractedItem[]> {
+  const prompt = `These are study notes belonging to an Italian learner of English. They come from lessons with native speakers, so they may be messy: bullet points, half sentences, mixed Italian and English.
 
 Extract EVERY English item worth revising: vocabulary, phrasal verbs, idioms, collocations, fixed expressions and useful grammar structures.
 
@@ -164,60 +246,40 @@ Rules:
 - Do not include bare proper nouns, page numbers or headings.
 - Extract generously: missing something the learner wrote down is worse than including something ordinary.
 
-Notes (block ${i + 1} of ${blocks.length}):
-${blocks[i]}`;
+Notes (block ${index + 1} of ${total}):
+${block}`;
 
-    // The model occasionally returns a near-empty array for a block that plainly
-    // holds dozens of entries. It is not deterministic, so the guard is to notice
-    // an implausibly thin result and ask again, keeping the richest answer.
-    const minPlausible = Math.max(3, Math.floor(blocks[i].length / 400));
-    let best: ExtractedItem[] = [];
+  // The model intermittently returns a near-empty array for a block that plainly
+  // holds dozens of entries, and it is not deterministic. Asking again fixes it,
+  // but each retry costs a request out of a very small daily allowance, so only
+  // a result that is obviously broken earns one more try.
+  const clearlyBroken = 2;
+  let best: ExtractedItem[] = [];
 
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const res = await callWithRetry(() =>
-          ai.models.generateContent({
-            model: "gemini-3.6-flash",
-            contents: prompt,
-            config: {
-              responseMimeType: "application/json",
-              responseSchema: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    phrase: { type: Type.STRING },
-                    translation: { type: Type.STRING },
-                    context: { type: Type.STRING },
-                    category: { type: Type.STRING },
-                  },
-                  required: ["phrase", "translation"],
-                },
-              },
-            },
-          })
-        );
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const res = await callWithRetry(() =>
+      ai.models.generateContent({
+        model: "gemini-3.6-flash",
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: EXTRACTION_SCHEMA,
+          maxOutputTokens: MAX_OUTPUT_TOKENS,
+        },
+      })
+    );
 
-        const parsed = res.text ? JSON.parse(res.text) : [];
-        const got: ExtractedItem[] = Array.isArray(parsed) ? parsed : [];
-        if (got.length > best.length) best = got;
+    const parsed = res.text ? JSON.parse(res.text) : [];
+    const got: ExtractedItem[] = Array.isArray(parsed) ? parsed : [];
+    if (got.length > best.length) best = got;
 
-        if (best.length >= minPlausible) break;
-        console.warn(
-          `[KNOWLEDGE] Block ${i + 1}: only ${got.length} items for ${blocks[i].length} chars ` +
-            `(expected >= ${minPlausible}), retrying`
-        );
-      } catch (err: any) {
-        console.warn(`[KNOWLEDGE] Block ${i + 1} attempt ${attempt + 1} failed:`, err?.message || err);
-      }
-    }
-
-    collected.push(...best);
+    if (best.length > clearlyBroken) break;
+    console.warn(
+      `[KNOWLEDGE] Block ${index + 1}: only ${got.length} items for ${block.length} chars, retrying once`
+    );
   }
 
-  const deduped = dedupeItems(collected);
-  console.log(`[KNOWLEDGE] Extracted ${deduped.length} unique items (${collected.length} raw)`);
-  return deduped;
+  return best;
 }
 
 app.post("/api/knowledge/extract-text", async (req, res) => {
@@ -229,6 +291,10 @@ app.post("/api/knowledge/extract-text", async (req, res) => {
     const items = await extractVocabulary(text);
     return res.json({ success: true, items, excerpt: text.slice(0, 8000) });
   } catch (error: any) {
+    if (error instanceof QuotaExceededError) {
+      console.warn("[KNOWLEDGE] extract-text blocked by daily quota");
+      return res.status(429).json({ error: "Hai esaurito le richieste di analisi disponibili per oggi sul piano gratuito di Google (20 al giorno). Riprova domani, oppure carica meno materiale per volta." });
+    }
     console.error("[KNOWLEDGE] extract-text failed:", error?.message);
     return res.status(500).json({ error: error.message || "Estrazione fallita." });
   }
@@ -258,6 +324,10 @@ app.post("/api/knowledge/extract-pdf", upload.single("file"), async (req, res) =
     const items = await extractVocabulary(text);
     return res.json({ success: true, items, excerpt: text.slice(0, 8000) });
   } catch (error: any) {
+    if (error instanceof QuotaExceededError) {
+      console.warn("[KNOWLEDGE] extract-pdf blocked by daily quota");
+      return res.status(429).json({ error: "Hai esaurito le richieste di analisi disponibili per oggi sul piano gratuito di Google (20 al giorno). Riprova domani, oppure carica meno materiale per volta." });
+    }
     console.error("[KNOWLEDGE] extract-pdf failed:", error?.message);
     return res.status(500).json({ error: error.message || "Lettura del file fallita." });
   }
